@@ -1,0 +1,22 @@
+# core
+pandas
+numpy
+
+# Streamlit TradeTracker app
+streamlit
+plotly
+pytz
+pandas-market-calendars   # optional but used for NYSE schedule if available
+holidays                  # optional, used for holiday names
+
+# Desktop TradingCompanion app
+matplotlib
+pillow                    # needed for "Copy Chart" to clipboard on Windows
+kaleido
+pywin32
+
+
+pyinstaller
+
+# Tax App
+openpyxl
