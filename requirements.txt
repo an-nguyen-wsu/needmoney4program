@@ -1,6 +1,7 @@
 # core
 pandas
 numpy
+platformdirs
 
 # Streamlit TradeTracker app
 streamlit

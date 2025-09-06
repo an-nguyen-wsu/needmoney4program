@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import csv
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -30,14 +31,54 @@ import os
 import hashlib
 from functools import lru_cache
 
+try:
+    # pip install platformdirs
+    from platformdirs import user_config_path
+except Exception:
+    user_config_path = None
 
-# -------------------------
-# CHANGE THESE FOR EACH UNIQUE COMPUTER (User-configurable defaults)
-# -------------------------
-DEFAULT_FOLDER = r"C:\Users\an\Desktop\Trading\Daily Trade History"
-SEC_RATE_SCHEDULE_PATH_DEFAULT = (
-    r"C:\Users\an\Desktop\Trading\VSCode Apps\sec_rate_schedule.csv"
+
+APP_NAME = "TradeTracker"
+CONFIG_FILENAME = "config.json"
+
+def _config_path() -> Path:
+    # store config in the project folder, next to the main script
+    return Path(__file__).parent / "config.json"
+
+
+def load_user_config() -> dict:
+    p = _config_path()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        # Normalize into Path objects
+        return {k: Path(v).expanduser() for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def save_user_config(cfg: dict) -> None:
+    # Convert all values to forward-slash style before writing
+    clean_cfg = {k: str(Path(v).expanduser().resolve().as_posix()) for k, v in cfg.items()}
+    p = _config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(clean_cfg, indent=2), encoding="utf-8")
+
+# ---- Device-specific config (env > user-config file > fallback) ----
+_FALLBACKS = {
+    "raw_csvs": r"C:\Users\an\Desktop\Trading\Daily Trade History",
+    "sec_schedule": r"C:\Users\an\Desktop\Trading\VSCode Apps\sec_rate_schedule.csv",
+}
+
+_cfg = load_user_config()
+
+DEFAULT_FOLDER = _cfg.get("raw_csvs", Path("C:/Users/an/Desktop/Trading/Daily Trade History"))
+SEC_RATE_SCHEDULE_PATH_DEFAULT = _cfg.get(
+    "sec_schedule",
+    Path("C:/Users/an/Desktop/Trading/VSCode Apps/sec_rate_schedule.csv")
 )
+
 
 TIMEZONE_EASTERN = pytz.timezone("America/New_York")
 TIMEZONE_PACIFIC = pytz.timezone("America/Los_Angeles")
@@ -149,6 +190,146 @@ def range_cumulative_curve(
     out = d[["date", "daily_profit"]].copy().sort_values("date")
     out["equity"] = out["daily_profit"].cumsum()
     return out[["date", "equity"]]
+
+@st.cache_data(show_spinner=False)
+def _nyse_holidays_year_cached(y: int) -> dict:
+    """Return {date: 'Holiday Name'} for NYSE holidays in a given year."""
+    # Reuse your existing nyse_holidays_named helper internally
+    return nyse_holidays_named(date(y, 1, 1), date(y, 12, 31))
+
+@st.cache_data(show_spinner=False)
+def _year_view_html(daily_df: pd.DataFrame, year: int) -> str:
+    """
+    Build the Year View HTML (4x3 months, Jan→Dec), with:
+      - day tiles colored (green win / red loss / yellow NYSE holiday)
+      - bottom-of-month stats aligned
+    Returns a single HTML string to feed into st.markdown(..., unsafe_allow_html=True).
+    """
+    if daily_df.empty:
+        return "<div>No daily stats available for this year.</div>"
+
+    d = daily_df.copy()
+    d["dts"] = pd.to_datetime(d["date"], errors="coerce")
+    ydf = d.loc[d["dts"].dt.year == year].copy()
+
+    # Classify days once
+    pos_days = set(ydf.loc[ydf["daily_profit"] > 0, "dts"].dt.date.tolist())
+    neg_days = set(ydf.loc[ydf["daily_profit"] < 0, "dts"].dt.date.tolist())
+
+    # NYSE holidays (weekday holidays) once
+    holinames = _nyse_holidays_year_cached(year)
+    holi_days = set(holinames.keys())
+
+    # Per-month summaries
+    month_sum = (
+        ydf.assign(month=ydf["dts"].dt.month)
+           .groupby("month", as_index=False)
+           .agg(net=("daily_profit", "sum"),
+                fees=("fees", "sum"),
+                trades=("num_trades", "sum"))
+    ).set_index("month")
+
+    # ---------- CSS ----------
+    css = """
+    <style>
+      .yv-wrap   { margin-top: 6px; }
+      .yv-grid   { display:grid; grid-template-columns: repeat(4, 1fr); gap:14px; }
+      .yv-month  { border:1px solid rgba(255,255,255,0.10); border-radius:14px; padding:10px 10px 8px; background:rgba(255,255,255,0.03); }
+      .yv-mname  { font-weight:700; font-size:0.95rem; margin-bottom:6px; text-align:center; }
+      .yv-cal    { display:grid; grid-template-columns: repeat(7, 1fr); gap:6px; min-height: 150px; }
+      .yv-day    { border-radius:8px; padding:6px 0; text-align:center; font-size:0.80rem; }
+      .yv-day.muted { opacity:0.35; }
+      .yv-day.pos   { background: rgba(46,125,50,0.18); }
+      .yv-day.neg   { background: rgba(139,45,45,0.18); }
+      .yv-day.holi  { background: rgba(255,235,59,0.22); }  /* yellowish */
+      .yv-stats { margin-top:8px; font-size:0.82rem; display:flex; justify-content:space-between; }
+      .yv-stats .left  { font-weight:600; }
+      .yv-stats .right { text-align:right; flex-shrink:0; min-width: 110px; }
+      .yv-fee { opacity:0.85; }
+      .yv-net-pos { color:#2e7d32; font-weight:700; }
+      .yv-net-neg { color:#8b2d2d; font-weight:700; }
+    </style>
+    """
+
+    # ---------- HTML calendar ----------
+    from calendar import monthrange
+    import datetime as _dt
+
+    def _fmt_money(x):
+        return f"${x:,.2f}"
+
+    months_html = []
+    for m in range(1, 13):
+        # month name
+        mname = _dt.date(year, m, 1).strftime("%B")
+
+        # first weekday offset (Mon=0, Sun=6 for monthrange? actually returns (weekday_of_first, days_in_month) with Mon=0)
+        first_wkday, ndays = monthrange(year, m)
+        # we want grid starting on Sun; convert: Mon=0 -> Sun index 6
+        # easier: build dates and use .weekday() (Mon=0..Sun=6) then map
+        def _weekday_to_sunfirst(w):  # Mon=0..Sun=6 -> Sun=0..Sat=6
+            return (w + 1) % 7
+
+        # leading blanks
+        lead = _weekday_to_sunfirst(_dt.date(year, m, 1).weekday())
+
+        cells = []
+        # blanks
+        for _ in range(lead):
+            cells.append('<div class="yv-day muted">&nbsp;</div>')
+
+        # actual days
+        for daynum in range(1, ndays + 1):
+            dt = _dt.date(year, m, daynum)
+            cls = ["yv-day"]
+            if dt in holi_days:
+                cls.append("holi")
+            elif dt in pos_days:
+                cls.append("pos")
+            elif dt in neg_days:
+                cls.append("neg")
+            c = " ".join(cls)
+            cells.append(f'<div class="{c}">{daynum}</div>')
+
+        cal_html = f'<div class="yv-cal">{"".join(cells)}</div>'
+
+        # month stats (aligned)
+        net  = float(month_sum.loc[m, "net"])   if m in month_sum.index else 0.0
+        fees = float(month_sum.loc[m, "fees"])  if m in month_sum.index else 0.0
+        trs  = int(month_sum.loc[m, "trades"])  if m in month_sum.index else 0
+        net_cls = "yv-net-pos" if net >= 0 else "yv-net-neg"
+        stats_html = (
+            f'<div class="yv-stats">'
+            f'  <div class="left">{trs} trades</div>'
+            f'  <div class="right"><span class="yv-fee">{_fmt_money(fees)}</span>&nbsp;&nbsp;'
+            f'  <span class="{net_cls}">{_fmt_money(net)}</span></div>'
+            f'</div>'
+        )
+
+        months_html.append(
+            f'<div class="yv-month">'
+            f'  <div class="yv-mname">{mname}</div>'
+            f'  {cal_html}'
+            f'  {stats_html}'
+            f'</div>'
+        )
+
+    body = f'<div class="yv-wrap"><div class="yv-grid">{"".join(months_html)}</div></div>'
+    return css + body
+
+
+@st.cache_data(show_spinner=False)
+def _csv_bytes_trades(trades: pd.DataFrame) -> bytes:
+    if trades.empty: return b""
+    t = trades.copy()
+    t["entry_time"] = t["entry_time"].dt.tz_convert(TIMEZONE_PACIFIC).dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    t["exit_time"]  = t["exit_time"].dt.tz_convert(TIMEZONE_PACIFIC).dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    return t.to_csv(index=False).encode("utf-8")
+
+@st.cache_data(show_spinner=False)
+def _csv_bytes_daily(daily: pd.DataFrame) -> bytes:
+    if daily.empty: return b""
+    return daily.to_csv(index=False).encode("utf-8")
 
 
 # -------------------------
@@ -456,6 +637,17 @@ def _load_all_trades_daily_from_cache(folder: Path) -> tuple[pd.DataFrame, pd.Da
 
     return trades, daily
 
+def _sec_sched_hash(df: pd.DataFrame) -> tuple:
+    if df is None or df.empty:
+        return ()
+    cols = [c for c in ["effective_from","end_date","rate_per_million"] if c in df.columns]
+    slim = df[cols].copy()
+    # Make serializable & stable
+    slim["effective_from"] = pd.to_datetime(slim["effective_from"], errors="coerce").astype("int64")
+    if "end_date" in slim:
+        slim["end_date"] = pd.to_datetime(slim["end_date"], errors="coerce").astype("int64")
+    slim["rate_per_million"] = pd.to_numeric(slim["rate_per_million"], errors="coerce").fillna(0.0).round(10)
+    return tuple(map(tuple, slim.fillna(0).to_numpy()))
 
 
 # -------------------------
@@ -1052,6 +1244,9 @@ def compute_daily_stats(
 # -------------------------
 # Calendar utilities
 # -------------------------
+@st.cache_data(show_spinner=False)
+def _nyse_holidays_year_cached(y: int) -> dict[date, str]:
+    return nyse_holidays_named(date(y, 1, 1), date(y, 12, 31))
 
 
 def nyse_holidays_named(start_dt: date, end_dt: date) -> dict[date, str]:
@@ -1229,6 +1424,11 @@ with st.sidebar:
         key="sec_path",  # <- ensures helper refreshes after edits
     )
 
+    save_defaults = st.button("💾 Save config file", use_container_width=True)
+    if save_defaults:
+        save_user_config({"raw_csvs": folder_str, "sec_schedule": sec_path})
+        st.success("Saved defaults for this device.")
+
     folder = Path(folder_str).expanduser()
     sec_schedule = load_sec_rate_schedule(sec_path)
 
@@ -1250,15 +1450,26 @@ if refresh:
 
 cache_dir = _cache_dir_for(folder)
 
-# Step 1: ensure per-file fills shards are up-to-date (returns affected PST dates)
-idx, affected_dates = _scan_and_update_file_fills(folder, sec_schedule)
+# --- Fast-change detection ---
+sig = folder_signature(folder)  # tuple of (file, mtime, size)
+sec_hash = _sec_sched_hash(sec_schedule)
 
-# Step 2: if nothing changed since last run, affected_dates will be empty; otherwise rebuild those days only
-_rebuild_days_from_fills(folder, idx, affected_dates)
+last_sig = st.session_state.get("last_sig")
+last_sec_hash = st.session_state.get("last_sec_hash")
 
-# Step 3: assemble full frames from cached per-day shards
+need_rebuild = (sig != last_sig) or (sec_hash != last_sec_hash) or refresh
+
+if need_rebuild:
+    # Step 1: scan & update per-file shards
+    idx, affected_dates = _scan_and_update_file_fills(folder, sec_schedule)
+    # Step 2: rebuild only changed PST days
+    _rebuild_days_from_fills(folder, idx, affected_dates)
+    # Persist signatures for next run
+    st.session_state["last_sig"] = sig
+    st.session_state["last_sec_hash"] = sec_hash
+
+# Step 3: assemble frames from per-day shards (cheap)
 trades, daily = _load_all_trades_daily_from_cache(folder)
-#fills = _load_all_fills_from_cache(folder)
 
 
 # (Optional) If first-ever run with no shards yet: fall back once to legacy path so UI still works
@@ -1277,50 +1488,43 @@ if trades.empty and daily.empty:
         _rebuild_days_from_fills(folder, idx, all_days)
         trades, daily = _load_all_trades_daily_from_cache(folder)
 
+@st.cache_data(show_spinner=False)
+def _build_trades_display_cached(trades_df: pd.DataFrame) -> pd.DataFrame:
+    if trades_df.empty:
+        return trades_df
 
-# --- Precompute Trade Log display fields once per run ---
-if not trades.empty:
-    _trades_disp = trades.copy()
+    view = trades_df.copy()
 
-    # PST date/day once
-    exit_dt_pst = _trades_disp["exit_time"].dt.tz_convert(TIMEZONE_PACIFIC)
-    _trades_disp["date_pst"] = exit_dt_pst.dt.strftime(
-        "%b %d, %Y"
-    )  # e.g. "Aug 18, 2025"
-    _trades_disp["day_pst"] = exit_dt_pst.dt.strftime("%a")
+    # PST date/day
+    exit_dt_pst = view["exit_time"].dt.tz_convert(TIMEZONE_PACIFIC)
+    view["date_pst"] = exit_dt_pst.dt.strftime("%b %d, %Y")
+    view["day_pst"]  = exit_dt_pst.dt.strftime("%a")
 
-    # PST time strings once
+    # PST time strings
     for col in ["entry_time", "exit_time"]:
-        _trades_disp[col] = (
-            pd.to_datetime(_trades_disp[col], errors="coerce")
+        view[col] = (
+            pd.to_datetime(view[col], errors="coerce")
             .dt.tz_convert(TIMEZONE_PACIFIC)
             .dt.strftime("%I:%M:%S %p")
         )
 
-    # Pre-format strings once
-    profit_emoji = np.where(
-        _trades_disp["profit_net"] > 0,
-        "🟢",
-        np.where(_trades_disp["profit_net"] < 0, "🔴", "⚪"),
-    )
-    _trades_disp["profit_net_str"] = (
-        profit_emoji + " " + _trades_disp["profit_net"].map(lambda x: f"${x:,.2f}")
-    )
-    _trades_disp["fees_str"] = _trades_disp["fee_total"].map(lambda x: f"${x:,.2f}")
-    _trades_disp["cps_str"] = _trades_disp["cents_per_share"].map(
-        lambda x: f"{x:.2f}¢" if pd.notna(x) else "—"
-    )
-    _trades_disp["shares_str"] = _trades_disp["shares"].map(lambda x: f"{int(x):,}")
+    profit_emoji = np.where(view["profit_net"] > 0, "🟢", np.where(view["profit_net"] < 0, "🔴", "⚪"))
+    view["profit_net_str"] = profit_emoji + " " + view["profit_net"].map(lambda x: f"${x:,.2f}")
+    view["fees_str"]       = view["fee_total"].map(lambda x: f"${x:,.2f}")
+    view["cps_str"]        = view["cents_per_share"].map(lambda x: f"{x:.2f}¢" if pd.notna(x) else "—")
+    view["shares_str"]     = view["shares"].map(lambda x: f"{int(x):,}")
 
-    # Human-readable duration once (vectorized)
-    td_secs = _trades_disp["time_in_trade"].dt.total_seconds().fillna(0).astype("int64")
-    _trades_disp["duration_str"] = np.where(
+    td_secs = view["time_in_trade"].dt.total_seconds().fillna(0).astype("int64")
+    view["duration_str"] = np.where(
         td_secs < 60,
         td_secs.astype(str) + " sec",
         (td_secs // 60).astype(str) + " min " + (td_secs % 60).astype(str) + " sec",
     )
-else:
-    _trades_disp = trades  # keep an empty DF for the tab logic
+    return view
+
+
+# --- Precompute Trade Log display fields once per run ---
+_trades_disp = _build_trades_display_cached(trades)
 
 
 
@@ -1329,20 +1533,9 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Exports")
     if not trades.empty:
-        csv_trades = trades.copy()
-        csv_trades["entry_time"] = (
-            csv_trades["entry_time"]
-            .dt.tz_convert(TIMEZONE_PACIFIC)
-            .dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-        )
-        csv_trades["exit_time"] = (
-            csv_trades["exit_time"]
-            .dt.tz_convert(TIMEZONE_PACIFIC)
-            .dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-        )
         st.download_button(
             "💾 Full Trade Log (CSV)",
-            data=csv_trades.to_csv(index=False).encode("utf-8"),
+            data=_csv_bytes_trades(trades),
             file_name="trade_log.csv",
             mime="text/csv",
             key="dl_trades_sidebar",
@@ -1351,12 +1544,13 @@ with st.sidebar:
     if not daily.empty:
         st.download_button(
             "💾 Full Daily Stats (CSV)",
-            data=daily.to_csv(index=False).encode("utf-8"),
+            data=_csv_bytes_daily(daily),
             file_name="daily_stats.csv",
             mime="text/csv",
             key="dl_daily_sidebar",
             width="content",
         )
+
 
 
 # -------------
@@ -1757,7 +1951,7 @@ elif nav == "🎉 Year View":
         years = sorted(_d["dts"].dt.year.dropna().unique().tolist())
         default_year = years[-1]
 
-        # ---------- Top bar layout: left = title/YTD, right = Year selector + Fees (right-justified) ----------
+        # ---------- Top bar: left = title/YTD, right = Year selector + Fees ----------
         top_left, top_right = st.columns([5, 3], gap="small")
 
         with top_right:
@@ -1766,143 +1960,32 @@ elif nav == "🎉 Year View":
                 options=years,
                 index=years.index(default_year),
                 key="year_view_year",
-                label_visibility="collapsed",  # keep compact
+                label_visibility="collapsed",
             )
 
-        # Slice for the chosen year and compute YTD numbers
+        # Slice for chosen year and compute YTD
         ydf = _d[_d["dts"].dt.year == year].copy()
         ytd_net  = float(ydf["daily_profit"].sum()) if not ydf.empty else 0.0
         ytd_fees = float(ydf["fees"].sum())         if "fees" in ydf.columns else 0.0
 
-        # Classify days
-        pos_days = set(ydf.loc[ydf["daily_profit"] > 0, "dts"].dt.date.tolist())
-        neg_days = set(ydf.loc[ydf["daily_profit"] < 0, "dts"].dt.date.tolist())
-
-        # NYSE weekday holidays (yellow)
-        holinames = nyse_holidays_named(date(year, 1, 1), date(year, 12, 31))
-        holi_days = set(holinames.keys())
-
-        # ---------- Styles ----------
-        st.markdown(
-            """
-            <style>
-              /* top bar */
-              .yv-bar { display:flex; align-items:center; justify-content:space-between; margin: 0 0 6px 0; }
-              .yv-title { font-size: 1.8rem; font-weight: 800; }
-              .yv-title .ytd { font-weight: 700; opacity: 0.95; }
-              .yv-right { text-align: right; line-height: 1.2; }
-              .yv-right .fees { font-weight: 600; }
-
-              /* month grid */
-              .year-grid {
-                display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
-                grid-auto-rows: 1fr;   /* all rows same height */
-                gap: 12px; margin-top: 6px;
-              }
-              .month {
-                height: 100%;
-                display: flex; flex-direction: column;
-                background: rgba(255,255,255,0.03);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 12px; padding: 8px 10px;
-              }
-              .month-title { text-align: center; font-weight: 700; margin-bottom: 6px; }
-
-              .cal-wrap { flex: 1; } /* keeps stats pinned to bottom uniformly */
-              .cal { width: 100%; table-layout: fixed; border-collapse: collapse; }
-              .cal td {
-                height: 18px; vertical-align: middle; text-align: center;
-                border: 1px solid rgba(255,255,255,0.05);
-                font-size: 0.70rem; padding: 0;
-              }
-              .cal td.off { background: rgba(255,255,255,0.02); }
-              .cal td.day { background: rgba(255,255,255,0.02); }
-              .cal td.pos { background: #2e7d32; color: #fff; }
-              .cal td.neg { background: #8b2d2d; color: #fff; }
-              .cal td.holiday { background: #d9a81e; color: #000; font-weight: 700; }
-
-              .month-stats {
-                margin-top: 8px; font-size: 0.80rem; text-align: center; opacity: 0.95;
-                min-height: 22px; white-space: nowrap;  /* keep one line; same height in every tile */
-              }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # Render top bar
         with top_left:
+            net_cls = "color:#2e7d32;font-weight:800;" if ytd_net >= 0 else "color:#8b2d2d;font-weight:800;"
             st.markdown(
-                f'<div class="yv-bar">'
-                f'  <div class="yv-title">{year} &nbsp;·&nbsp; <span class="ytd">YTD: {fmt_money(ytd_net)}</span></div>'
-                f'</div>',
+                f"""
+                <div class="yv-bar">
+                  <div style="font-size:1.2rem;font-weight:800;">{year}</div>
+                  <div style="display:flex;gap:18px;align-items:center;">
+                    <div style="{net_cls}">YTD Net {ytd_net:,.2f}</div>
+                    <div style="opacity:0.85;">Fees {fmt_money(ytd_fees)}</div>
+                  </div>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
-        with top_right:
-            st.markdown(
-                f'<div class="yv-right"><div class="fees">Fees YTD: {fmt_money(ytd_fees)}</div></div>',
-                unsafe_allow_html=True,
-            )
 
-        # ---------- Build 4×3 month grid ----------
-        MONTHS = [
-            "January","February","March","April","May","June",
-            "July","August","September","October","November","December"
-        ]
-
-        # Helper: month stats
-        def _month_stats(m: int) -> tuple[float, float, int]:
-            mdf = ydf[ydf["dts"].dt.month == m]
-            if mdf.empty:
-                return 0.0, 0.0, 0
-            m_profit = float(mdf["daily_profit"].sum())
-            m_fees   = float(mdf["fees"].sum()) if "fees" in mdf.columns else 0.0
-            m_trades = int(mdf["num_trades"].sum()) if "num_trades" in mdf.columns else 0
-            return m_profit, m_fees, m_trades
-
-        html = ['<div class="year-grid">']
-
-        for m in range(1, 13):
-            weeks = build_month_grid(year, m)  # weeks of 7 dates, Sun→Sat
-            m_profit, m_fees, m_trades = _month_stats(m)
-
-            html.append('<div class="month">')
-            html.append(f'<div class="month-title">{MONTHS[m-1]}</div>')
-
-            # Calendar table (no weekday letters)
-            html.append('<div class="cal-wrap">')
-            html.append('<table class="cal">')
-            for wk in weeks:
-                html.append("<tr>")
-                for d in wk:
-                    if d.month != m:
-                        html.append('<td class="off"></td>')
-                        continue
-                    cls = "day"
-                    if d in holi_days:
-                        cls += " holiday"
-                    elif d in pos_days:
-                        cls += " pos"
-                    elif d in neg_days:
-                        cls += " neg"
-                    title = holinames.get(d, "")
-                    html.append(f'<td class="{cls}" title="{title}">{d.day}</td>')
-                html.append("</tr>")
-            html.append("</table>")
-            html.append("</div>")  # .cal-wrap
-
-            # Bottom stats: Net; include Fees only if >0; trades always
-            stats = f"Net: {fmt_money(m_profit)}"
-            if m_fees > 0.0:
-                stats += f" · Fees: {fmt_money(m_fees)}"
-            stats += f" · {m_trades:,} trades"
-            html.append(f'<div class="month-stats">{stats}</div>')
-
-            html.append("</div>")  # .month
-
-        html.append("</div>")  # .year-grid
-        st.markdown("".join(html), unsafe_allow_html=True)
+        # ---------- Cached HTML ----------
+        html = _year_view_html(daily, year)
+        st.markdown(html, unsafe_allow_html=True)
 
 
 
