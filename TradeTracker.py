@@ -13,7 +13,7 @@ import pandas as pd
 import pytz
 import streamlit as st
 
-# Optional libs (calendar/holidays + charts)
+
 try:
     import pandas_market_calendars as mcal  # NYSE trading calendar & holidays
 except Exception:
@@ -21,6 +21,7 @@ except Exception:
 
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 
 import base64
 import math
@@ -123,8 +124,10 @@ def _ceil_to_next_15min(ts: pd.Timestamp) -> pd.Timestamp:
     return (ts + pd.Timedelta(minutes=add)).replace(second=0, microsecond=0)
 
 
+import numpy as np
+
 @st.cache_data(show_spinner=False)
-def daily_running_curve(trades_df: pd.DataFrame, day: date) -> pd.DataFrame:
+def daily_running_curve(_trades_df: pd.DataFrame, day: date, trades_sig: tuple) -> pd.DataFrame:
     """
     Build the *realized* intraday running NET P/L curve for a Pacific 'day'.
     Returns columns: ['time' (tz-aware, PT), 'equity'] in chronological order.
@@ -132,64 +135,53 @@ def daily_running_curve(trades_df: pd.DataFrame, day: date) -> pd.DataFrame:
     Notes:
     - Uses trade EXIT times, so curve steps when a trade closes.
     - Starts at 6:30 PT at $0.
+
+    Caching: `_trades_df` is ignored for hashing; `trades_sig` is the cache key.
     """
-    if trades_df.empty:
+    if _trades_df.empty:
         return pd.DataFrame(columns=["time", "equity"])
 
-    # Filter trades to that Pacific calendar day by EXIT time
-    t = trades_df.copy()
-    t["date_pst"] = t["exit_time"].dt.tz_convert(TIMEZONE_PACIFIC).dt.date
-    t = t[t["date_pst"] == day].sort_values("exit_time")
-
-    start_ts = pd.Timestamp(
-        year=day.year,
-        month=day.month,
-        day=day.day,
-        hour=6,
-        minute=30,
-        tz=TIMEZONE_PACIFIC,
-    )
-
-    if t.empty:
-        # No trades that day -> flat line for 15 minutes so axis renders nicely.
-        return pd.DataFrame(
-            {
-                "time": [start_ts, start_ts + pd.Timedelta(minutes=15)],
-                "equity": [0.0, 0.0],
-            }
+    # Filter by Pacific calendar day using EXIT time
+    exit_pst = _trades_df["exit_time"].dt.tz_convert(TIMEZONE_PACIFIC)
+    mask = exit_pst.dt.date == day
+    if not mask.any():
+        start_ts = pd.Timestamp(
+            year=day.year, month=day.month, day=day.day, hour=6, minute=30, tz=TIMEZONE_PACIFIC
         )
+        return pd.DataFrame({"time": [start_ts, start_ts + pd.Timedelta(minutes=15)], "equity": [0.0, 0.0]})
 
-    times = [start_ts]
-    equity = [0.0]
-    run = 0.0
-    for r in t.itertuples(index=False):
-        ts = r.exit_time.tz_convert(TIMEZONE_PACIFIC)
-        run += float(r.profit_net)  # NET P/L default everywhere in your app
-        times.append(ts)
-        equity.append(run)
+    t = _trades_df.loc[mask, ["profit_net"]].copy()
+    t["exit_pst"] = exit_pst.loc[mask]
+    t = t.sort_values("exit_pst")
 
+    # Build step-like series: start at 6:30 PT at 0, then step at each exit
+    start_ts = pd.Timestamp(
+        year=day.year, month=day.month, day=day.day, hour=6, minute=30, tz=TIMEZONE_PACIFIC
+    )
+    times = pd.DatetimeIndex([start_ts]).append(pd.DatetimeIndex(t["exit_pst"]))
+    equity = np.concatenate([[0.0], pd.to_numeric(t["profit_net"], errors="coerce").fillna(0.0).cumsum().to_numpy()])
     return pd.DataFrame({"time": times, "equity": equity})
 
 
 @st.cache_data(show_spinner=False)
-def range_cumulative_curve(
-    daily_df: pd.DataFrame, start_d: date, end_d: date
-) -> pd.DataFrame:
+def range_cumulative_curve(_daily_df: pd.DataFrame, start_d: date, end_d: date, daily_sig: tuple) -> pd.DataFrame:
     """
     Build a daily cumulative equity curve between [start_d, end_d], inclusive.
     Returns columns: ['date', 'equity'] where 'equity' is cumsum of NET daily_profit.
+
+    Caching: `_daily_df` is ignored for hashing; `daily_sig` is the cache key.
     """
-    if daily_df.empty:
+    if _daily_df.empty:
         return pd.DataFrame(columns=["date", "equity"])
 
-    d = daily_df.copy()
-    d = d[(d["date"] >= start_d) & (d["date"] <= end_d)].sort_values("date")
+    d = _daily_df.loc[(_daily_df["date"] >= start_d) & (_daily_df["date"] <= end_d), ["date", "daily_profit"]].copy()
     if d.empty:
         return pd.DataFrame(columns=["date", "equity"])
 
-    out = d[["date", "daily_profit"]].copy().sort_values("date")
-    out["equity"] = out["daily_profit"].cumsum()
-    return out[["date", "equity"]]
+    d = d.sort_values("date", kind="mergesort")  # stable + fast
+    d["equity"] = pd.to_numeric(d["daily_profit"], errors="coerce").fillna(0.0).cumsum()
+    return d[["date", "equity"]]
+
 
 @st.cache_data(show_spinner=False)
 def _nyse_holidays_year_cached(y: int) -> dict:
@@ -198,25 +190,21 @@ def _nyse_holidays_year_cached(y: int) -> dict:
     return nyse_holidays_named(date(y, 1, 1), date(y, 12, 31))
 
 @st.cache_data(show_spinner=False)
-def _year_view_html(daily_df: pd.DataFrame, year: int) -> str:
-    """
-    Build the Year View HTML (4x3 months, Jan→Dec), with:
-      - day tiles colored (green win / red loss / yellow NYSE holiday)
-      - bottom-of-month stats aligned
-    Returns a single HTML string to feed into st.markdown(..., unsafe_allow_html=True).
-    """
+def _year_view_html(daily_df: pd.DataFrame, year: int, cols: int = 4, compact: bool = False) -> str:
+
     if daily_df.empty:
         return "<div>No daily stats available for this year.</div>"
+
+    import datetime as _dt
+    from calendar import monthrange
 
     d = daily_df.copy()
     d["dts"] = pd.to_datetime(d["date"], errors="coerce")
     ydf = d.loc[d["dts"].dt.year == year].copy()
 
-    # Classify days once
+    # Day classifications
     pos_days = set(ydf.loc[ydf["daily_profit"] > 0, "dts"].dt.date.tolist())
     neg_days = set(ydf.loc[ydf["daily_profit"] < 0, "dts"].dt.date.tolist())
-
-    # NYSE holidays (weekday holidays) once
     holinames = _nyse_holidays_year_cached(year)
     holi_days = set(holinames.keys())
 
@@ -229,93 +217,114 @@ def _year_view_html(daily_df: pd.DataFrame, year: int) -> str:
                 trades=("num_trades", "sum"))
     ).set_index("month")
 
-    # ---------- CSS ----------
-    css = """
+    # Sizing
+    cell_h = 18 if compact else 22
+    gap_px = 3 if compact else 6
+    font_r = 0.68 if compact else 0.78
+
+    # Colors (solid, high-contrast)
+    green = "#16a34a"  # win
+    red   = "#dc2626"  # loss
+    grey= "#cacfde"  # holiday
+    orange = "f59e0b" # fees
+
+    css = f"""
     <style>
-      .yv-wrap   { margin-top: 6px; }
-      .yv-grid   { display:grid; grid-template-columns: repeat(4, 1fr); gap:14px; }
-      .yv-month  { border:1px solid rgba(255,255,255,0.10); border-radius:14px; padding:10px 10px 8px; background:rgba(255,255,255,0.03); }
-      .yv-mname  { font-weight:700; font-size:0.95rem; margin-bottom:6px; text-align:center; }
-      .yv-cal    { display:grid; grid-template-columns: repeat(7, 1fr); gap:6px; min-height: 150px; }
-      .yv-day    { border-radius:8px; padding:6px 0; text-align:center; font-size:0.80rem; }
-      .yv-day.muted { opacity:0.35; }
-      .yv-day.pos   { background: rgba(46,125,50,0.18); }
-      .yv-day.neg   { background: rgba(139,45,45,0.18); }
-      .yv-day.holi  { background: rgba(255,235,59,0.22); }  /* yellowish */
-      .yv-stats { margin-top:8px; font-size:0.82rem; display:flex; justify-content:space-between; }
-      .yv-stats .left  { font-weight:600; }
-      .yv-stats .right { text-align:right; flex-shrink:0; min-width: 110px; }
-      .yv-fee { opacity:0.85; }
-      .yv-net-pos { color:#2e7d32; font-weight:700; }
-      .yv-net-neg { color:#8b2d2d; font-weight:700; }
+      .yv2-grid {{
+        display:grid;
+        grid-template-columns: repeat({cols}, minmax(0, 1fr));
+        gap:{gap_px + 8}px;
+        margin-top:6px;
+      }}
+      .yv2-month {{
+        display:grid;
+        grid-template-rows: auto 1fr auto;  /* header / calendar / footer */
+        border:1px solid rgba(255,255,255,0.10);
+        border-radius:12px;
+        padding:8px 10px;
+        background:rgba(0,0,0,0.15);
+      }}
+      .yv2-mname {{ text-align:center; font-weight:700; margin-bottom:6px; }}
+      .yv2-cal {{
+        display:grid;
+        grid-template-columns: repeat(7, 1fr);
+        grid-auto-rows: {cell_h}px;         /* uniform rows: 5 or 6 */
+        gap:{gap_px}px;
+      }}
+      .yv2-day {{
+        display:flex; align-items:center; justify-content:center;
+        font-size:{font_r}rem; border-radius:6px;
+      }}
+      .yv2-day.muted {{ background:rgba(255,255,255,0.04); }}
+      .yv2-day.pos   {{ background:{green}; color:#fff; }}
+      .yv2-day.neg   {{ background:{red}; color:#fff; }}
+      .yv2-day.holi  {{ background:{grey}; color:#111; font-weight:700; }}
+
+      /* footer: left = trades, right = fees + net; single line, never wraps */
+      .yv2-stats {{
+        margin-top:6px;
+        display:grid;
+        grid-template-columns: 1fr auto;
+        column-gap:10px;
+        align-items:center;
+        white-space:nowrap;
+      }}
+      .yv2-stats .right {{ text-align:right; }}
+      .yv2-fee {{ color:{orange}; margin-right:10px; }}
+      .yv2-net.pos {{ color:{green}; font-weight:800; }}
+      .yv2-net.neg {{ color:{red}; font-weight:800; }}
     </style>
     """
 
-    # ---------- HTML calendar ----------
-    from calendar import monthrange
-    import datetime as _dt
-
-    def _fmt_money(x):
+    def _fmt(x: float) -> str:
         return f"${x:,.2f}"
 
     months_html = []
     for m in range(1, 13):
-        # month name
         mname = _dt.date(year, m, 1).strftime("%B")
 
-        # first weekday offset (Mon=0, Sun=6 for monthrange? actually returns (weekday_of_first, days_in_month) with Mon=0)
-        first_wkday, ndays = monthrange(year, m)
-        # we want grid starting on Sun; convert: Mon=0 -> Sun index 6
-        # easier: build dates and use .weekday() (Mon=0..Sun=6) then map
-        def _weekday_to_sunfirst(w):  # Mon=0..Sun=6 -> Sun=0..Sat=6
-            return (w + 1) % 7
-
-        # leading blanks
-        lead = _weekday_to_sunfirst(_dt.date(year, m, 1).weekday())
+        # Sunday-first grid with leading blanks
+        def _sunfirst(w): return (w + 1) % 7  # Mon=0..Sun=6 -> Sun=0..Sat=6
+        lead = _sunfirst(_dt.date(year, m, 1).weekday())
+        _, ndays = monthrange(year, m)
 
         cells = []
-        # blanks
         for _ in range(lead):
-            cells.append('<div class="yv-day muted">&nbsp;</div>')
-
-        # actual days
+            cells.append('<div class="yv2-day muted"></div>')
         for daynum in range(1, ndays + 1):
             dt = _dt.date(year, m, daynum)
-            cls = ["yv-day"]
+            klass = ["yv2-day"]
             if dt in holi_days:
-                cls.append("holi")
+                klass.append("holi")
             elif dt in pos_days:
-                cls.append("pos")
+                klass.append("pos")
             elif dt in neg_days:
-                cls.append("neg")
-            c = " ".join(cls)
-            cells.append(f'<div class="{c}">{daynum}</div>')
+                klass.append("neg")
+            else:
+                klass.append("muted")  # neutral day (no trading)
+            title = holinames.get(dt, "")
+            cells.append(f'<div class="{" ".join(klass)}" title="{title}">{daynum}</div>')
 
-        cal_html = f'<div class="yv-cal">{"".join(cells)}</div>'
+        cal_html = f'<div class="yv2-cal">{"".join(cells)}</div>'
 
-        # month stats (aligned)
-        net  = float(month_sum.loc[m, "net"])   if m in month_sum.index else 0.0
-        fees = float(month_sum.loc[m, "fees"])  if m in month_sum.index else 0.0
-        trs  = int(month_sum.loc[m, "trades"])  if m in month_sum.index else 0
-        net_cls = "yv-net-pos" if net >= 0 else "yv-net-neg"
+        # Stats
+        net   = float(month_sum.loc[m, "net"])   if m in month_sum.index else 0.0
+        fees  = float(month_sum.loc[m, "fees"])  if m in month_sum.index else 0.0
+        trs   = int(month_sum.loc[m, "trades"]) if m in month_sum.index else 0
+        net_cls = "pos" if net >= 0 else "neg"
         stats_html = (
-            f'<div class="yv-stats">'
-            f'  <div class="left">{trs} trades</div>'
-            f'  <div class="right"><span class="yv-fee">{_fmt_money(fees)}</span>&nbsp;&nbsp;'
-            f'  <span class="{net_cls}">{_fmt_money(net)}</span></div>'
+            f'<div class="yv2-stats">'
+            f'  <div class="left">{trs:,} trades</div>'
+            f'  <div class="right"><span class="yv2-fee">{_fmt(fees)}</span>'
+            f'  <span class="yv2-net {net_cls}">{_fmt(net)}</span></div>'
             f'</div>'
         )
 
         months_html.append(
-            f'<div class="yv-month">'
-            f'  <div class="yv-mname">{mname}</div>'
-            f'  {cal_html}'
-            f'  {stats_html}'
-            f'</div>'
+            f'<div class="yv2-month"><div class="yv2-mname">{mname}</div>{cal_html}{stats_html}</div>'
         )
 
-    body = f'<div class="yv-wrap"><div class="yv-grid">{"".join(months_html)}</div></div>'
-    return css + body
+    return css + f'<div class="yv2-grid">{"".join(months_html)}</div>'
 
 
 @st.cache_data(show_spinner=False)
@@ -1471,6 +1480,21 @@ if need_rebuild:
 # Step 3: assemble frames from per-day shards (cheap)
 trades, daily = _load_all_trades_daily_from_cache(folder)
 
+# Lightweight cache keys (change when data changes)
+trades_sig = (
+    int(len(trades)),
+    str(pd.to_datetime(trades["exit_time"]).min()) if not trades.empty else "",
+    str(pd.to_datetime(trades["exit_time"]).max()) if not trades.empty else "",
+    float(pd.to_numeric(trades.get("profit_net", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if "profit_net" in trades else 0.0,
+)
+
+daily_sig = (
+    int(len(daily)),
+    str(pd.to_datetime(daily["date"]).min()) if not daily.empty else "",
+    str(pd.to_datetime(daily["date"]).max()) if not daily.empty else "",
+    float(pd.to_numeric(daily.get("daily_profit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if "daily_profit" in daily else 0.0,
+)
+
 
 # (Optional) If first-ever run with no shards yet: fall back once to legacy path so UI still works
 if trades.empty and daily.empty:
@@ -1878,7 +1902,7 @@ elif nav == "🌄 Daily Stats":
                         x=pos["date"],
                         y=pos["daily_profit"],
                         name="Positive",
-                        marker_color="#2e7d32",
+                        marker_color="#428246",
                     )
                 if not neg.empty:
                     bar.add_bar(
@@ -1926,7 +1950,7 @@ elif nav == "🌄 Daily Stats":
                 x="day",
                 y="daily_profit",
                 color="sign",
-                color_discrete_map={"pos": "#2e7d32", "neg": "#8b2d2d"},
+                color_discrete_map={"pos": "#428246", "neg": "#8b2d2d"},
                 labels={"daily_profit": "Total P/L ($)", "day": "Weekday"},
                 title="Total P/L by Weekday",
             )
@@ -1937,7 +1961,7 @@ elif nav == "🌄 Daily Stats":
 
 
 # -------------
-# Year View tab (updated)
+# Year View tab (space-optimized, one-line KPIs, 4×3 only)
 # -------------
 elif nav == "🎉 Year View":
     st.subheader("🎉 Year View")
@@ -1946,45 +1970,91 @@ elif nav == "🎉 Year View":
         st.info("No daily stats available yet. Add CSV files to your folder or adjust settings.")
     else:
         # ---------- Data prep ----------
-        _d = daily.copy()
-        _d["dts"] = pd.to_datetime(_d["date"], errors="coerce")
-        years = sorted(_d["dts"].dt.year.dropna().unique().tolist())
-        default_year = years[-1]
+        d = daily.copy()
+        d["dts"] = pd.to_datetime(d["date"], errors="coerce")
+        years = sorted(d["dts"].dt.year.dropna().unique().tolist())
+        default_year = years[-1] if years else date.today().year
 
-        # ---------- Top bar: left = title/YTD, right = Year selector + Fees ----------
-        top_left, top_right = st.columns([5, 3], gap="small")
+        # Compact selectbox + KPI classes
+        st.markdown(
+            """
+            <style>
+              /* Make the Year select fit its content */
+              div[data-testid="stSelectbox"] { width: fit-content !important; }
+              div[data-testid="stSelectbox"] > div { width: fit-content !important; }
+              div[data-baseweb="select"] { min-width: 0 !important; }
 
-        with top_right:
+              /* KPI line */
+              .yv-line { display:flex; align-items:center; gap:18px; }  /* space between YTD and Fees */
+              .yv-kpi  { font-weight:700; }
+              .yv-pos  { color:#16a34a; font-weight:800; }  /* YTD >= 0 */
+              .yv-neg  { color:#dc2626; font-weight:800; }  /* YTD <  0 */
+              .yv-fee  { color:#f59e0b; font-weight:700; }  /* Fees orange */
+              .yv-right { text-align:right; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ---------- One-line top row ----------
+        # [ Year selector |  YTD + Fees + Trades  |  Days left (right edge) ]
+        c_sel, c_mid, c_right = st.columns([1.05, 6, 1.6], gap="small")
+
+        # Year selector (far left, compact)
+        with c_sel:
             year = st.selectbox(
                 "Year",
                 options=years,
-                index=years.index(default_year),
+                index=years.index(default_year) if years else 0,
                 key="year_view_year",
                 label_visibility="collapsed",
             )
 
-        # Slice for chosen year and compute YTD
-        ydf = _d[_d["dts"].dt.year == year].copy()
-        ytd_net  = float(ydf["daily_profit"].sum()) if not ydf.empty else 0.0
-        ytd_fees = float(ydf["fees"].sum())         if "fees" in ydf.columns else 0.0
+        # Slice for chosen year and compute KPIs
+        ydf = d[d["dts"].dt.year == year].copy()
+        ytd_net    = float(ydf["daily_profit"].sum()) if not ydf.empty else 0.0
+        ytd_fees   = float(ydf["fees"].sum())         if "fees" in ydf.columns else 0.0
+        ytd_trades = int(ydf["num_trades"].sum())     if "num_trades" in ydf.columns else 0
 
-        with top_left:
-            net_cls = "color:#2e7d32;font-weight:800;" if ytd_net >= 0 else "color:#8b2d2d;font-weight:800;"
+        # Trading days remaining in selected year (Mon–Fri, exclude NYSE holidays)
+        today = datetime.now(TIMEZONE_PACIFIC).date()
+        if year < today.year:
+            trading_days_left = 0
+        else:
+            start = today if year == today.year else date(year, 1, 1)
+            end   = date(year, 12, 31)
+            try:
+                holi_map = _nyse_holidays_year_cached(year)  # {date: "Holiday"}
+            except Exception:
+                holi_map = nyse_holidays_named(date(year, 1, 1), date(year, 12, 31))
+            holi_days = set(holi_map.keys())
+            trading_days_left = sum(
+                1
+                for n in range((end - start).days + 1)
+                if (start + timedelta(days=n)).weekday() < 5
+                and (start + timedelta(days=n)) not in holi_days
+            )
+
+        # KPIs: YTD (colored) + Fees (orange) + Trades — one line, centered block
+        net_cls = "yv-pos" if ytd_net >= 0 else "yv-neg"
+        with c_mid:
             st.markdown(
                 f"""
-                <div class="yv-bar">
-                  <div style="font-size:1.2rem;font-weight:800;">{year}</div>
-                  <div style="display:flex;gap:18px;align-items:center;">
-                    <div style="{net_cls}">YTD Net {ytd_net:,.2f}</div>
-                    <div style="opacity:0.85;">Fees {fmt_money(ytd_fees)}</div>
-                  </div>
+                <div class="yv-line">
+                  <span class="yv-kpi {net_cls}">YTD: {fmt_money(ytd_net)}</span>
+                  <span class="yv-kpi yv-fee">Fees: {fmt_money(ytd_fees)}</span>
+                  <span class="yv-kpi">Trades: {ytd_trades:,}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-        # ---------- Cached HTML ----------
-        html = _year_view_html(daily, year)
+        # Days left — far right
+        with c_right:
+            st.markdown(f'<div class="yv-kpi yv-right">Days left: {trading_days_left}</div>', unsafe_allow_html=True)
+
+        # ---------- Year grid: fixed at 4×3 (no 6×2 toggle) ----------
+        html = _year_view_html(daily, year, cols=4, compact=False)
         st.markdown(html, unsafe_allow_html=True)
 
 
@@ -2062,13 +2132,7 @@ elif nav == "📈 Equity Curves":
             if st.session_state.eq_mode == "single":
                 # Single-day selector (existing behavior)
                 # Build available days before using them here:
-                trade_days = (
-                    trades["exit_time"]
-                    .dt.tz_convert(TIMEZONE_PACIFIC)
-                    .dt.date.dropna()
-                    .unique()
-                )
-                trade_days = sorted(trade_days)
+
                 latest_day = trade_days[-1]
 
                 sel_day = st.date_input(
@@ -2131,7 +2195,7 @@ elif nav == "📈 Equity Curves":
             # Use the already-picked date from session state
             sel_day = st.session_state.get("eq_single_date")
 
-            curve = daily_running_curve(tdf, sel_day)  # cached
+            curve = daily_running_curve(trades, sel_day, trades_sig) # cached
 
             # Guard (no trades that day) -> flat line
             if curve.shape[0] == 2 and curve["equity"].abs().sum() == 0:
@@ -2237,14 +2301,14 @@ elif nav == "📈 Equity Curves":
                     autosize=False,
                     width=1000,
                     height=600,
-                    margin=dict(l=80, r=50, t=80, b=80),
+                    margin=dict(l=118, r=40, t=80, b=80),
                     plot_bgcolor="#0e1218",
                     paper_bgcolor="#0e1218",
                     font=dict(color="#e9eef7"),
                     showlegend=False,
                 )
 
-                fig.update_yaxes(title_standoff=34)
+                fig.update_yaxes(title_standoff=28, automargin=True)
                 fig.update_xaxes(range=[x_start, x_end], tickformat="%H:%M")
 
                 with left_col:
@@ -2255,60 +2319,101 @@ elif nav == "📈 Equity Curves":
                 with right_col:
                     st.markdown("### ")
                     st.markdown("### ")
-
-                    do_export = st.button(
-                        "Prepare PNG", width="content", key="eq_png_single"
-                    )
-                    png_bytes = None
+                    
+                    do_export = st.button("Prepare PNG", key="eq_png_single")
                     if do_export:
-                        try:
-                            fig_export = go.Figure(fig)
-                            fig_export.update_layout(
-                                margin=dict(l=120, r=24, t=80, b=80)
-                            )
-                            fig_export.update_yaxes(title_standoff=42, automargin=True)
-                            png_bytes = fig_export.to_image(
-                                format="png", scale=2, width=1000, height=600
-                            )
-                        except Exception:
-                            png_bytes = None
+                        import json, streamlit.components.v1 as components
+                        from plotly.utils import PlotlyJSONEncoder
+                        # Make a pure JSON object literal (not a string)
+                        fig_obj = go.Figure(fig).to_plotly_json()
+                        fig_json = json.dumps(fig_obj, cls=PlotlyJSONEncoder)
 
-                    if png_bytes:
-                        import base64, streamlit.components.v1 as components
+                        components.html(f"""
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap; padding-bottom:8px">
+                        <button id="saveBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">💾 Save PNG</button>
+                        <button id="copyBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">📋 Copy to clipboard</button>
+                        <span id="status" style="color:#aab6d3;font-size:12px"></span>
+                        </div>
+                        <div id="offscreen_single" style="position:absolute; left:-99999px; top:-99999px;"></div>
 
-                        b64 = base64.b64encode(png_bytes).decode("ascii")
-                        fname = f"equity_curve_{sel_day.isoformat()}.png"
-                        components.html(  # unchanged HTML buttons…
-                            f"""<div style="display:flex; flex-direction:column; gap:10px; max-width:220px;">
-                                <button id="saveBtn" style="padding:10px 14px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;">💾 Save PNG</button>
-                                <button id="copyBtn" style="padding:10px 14px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;">📋 Copy to clipboard</button>
-                                </div>
-                                <script>(function(){{
-                                const b64="{b64}", fname="{fname}";
-                                async function getBlob(){{const res=await fetch("data:image/png;base64,"+b64);return await res.blob();}}
-                                const saveBtn=document.getElementById("saveBtn");
-                                if(saveBtn)saveBtn.addEventListener("click",async()=>{{
-                                    try{{
-                                    const blob=await getBlob();
-                                    if(window.showSaveFilePicker){{
-                                        const handle=await window.showSaveFilePicker({{suggestedName:fname,types:[{{description:"PNG Image",accept:{{"image/png":[".png"]}}}}]}});
-                                        const w=await handle.createWritable();await w.write(blob);await w.close();saveBtn.textContent="✅ Saved";setTimeout(()=>saveBtn.textContent="💾 Save PNG",1600);
-                                    }}else{{const url=URL.createObjectURL(blob);window.open(url,"_blank");setTimeout(()=>URL.revokeObjectURL(url),5000);}}
-                                    }}catch(e){{saveBtn.textContent="Save failed";setTimeout(()=>saveBtn.textContent="💾 Save PNG",1600);}}
+                        <!-- Load Plotly INSIDE the iframe -->
+                        <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+                        <script>
+                        (function(){{
+                        const STATUS = document.getElementById("status");
+                        function setStatus(t) {{ if (STATUS) {{ STATUS.textContent = t; }} }}
+
+                        const fig = {fig_json}; // this is a real object literal
+                        const container = document.getElementById("offscreen_single");
+                        const saveBtn = document.getElementById("saveBtn");
+                        const copyBtn = document.getElementById("copyBtn");
+
+                        async function ensurePlotlyReady() {{
+                            // Wait until Plotly is available in this iframe
+                            const maxWait = 2000; const start = performance.now();
+                            while (!window.Plotly) {{
+                            if (performance.now() - start > maxWait) throw new Error("Plotly not loaded");
+                            await new Promise(r=>setTimeout(r,50));
+                            }}
+                        }}
+
+                        async function getBlob() {{
+                            await ensurePlotlyReady();
+                            if (!container.dataset.rendered) {{
+                            await window.Plotly.newPlot(container, fig.data, fig.layout, {{staticPlot:true, displayModeBar:false}});
+                            container.dataset.rendered = "1";
+                            }}
+                            const dataUrl = await window.Plotly.toImage(container, {{format:"png", width:1000, height:600, scale:2}});
+                            const res = await fetch(dataUrl);
+                            return await res.blob();
+                        }}
+
+                        if (saveBtn) saveBtn.addEventListener("click", async () => {{
+                            try {{
+                            setStatus("Rendering…");
+                            const blob = await getBlob();
+                            setStatus("");
+                            if (window.showSaveFilePicker) {{
+                                const handle = await window.showSaveFilePicker({{
+                                suggestedName: "equity_curve_{pd.Timestamp(sel_day).date().isoformat()}.png",
+                                types: [{{description:"PNG Image", accept: {{"image/png": [".png"]}}}}]
                                 }});
-                                const copyBtn=document.getElementById("copyBtn");
-                                if(copyBtn)copyBtn.addEventListener("click",async()=>{{
-                                    try{{const blob=await getBlob();await navigator.clipboard.write([new ClipboardItem({{"image/png":blob}})]);copyBtn.textContent="✅ Copied";setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard",1600);}}
-                                    catch(e){{copyBtn.textContent="Copy failed";setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard",1600);}}
-                                }});
-                                }})();</script>""",
-                            height=130,
-                        )
-                    else:
-                        with right_col:
-                            st.caption(
-                                "Tip: Use the camera icon in the chart toolbar to download."
-                            )
+                                const w = await handle.createWritable(); await w.write(blob); await w.close();
+                            }} else {{
+                                const url = URL.createObjectURL(blob);
+                                const a=document.createElement("a");
+                                a.href=url; a.download="equity_curve.png"; a.click();
+                                setTimeout(()=>URL.revokeObjectURL(url),5000);
+                            }}
+                            saveBtn.textContent = "✅ Saved"; setTimeout(()=>saveBtn.textContent="💾 Save PNG", 1600);
+                            }} catch(e) {{
+                            setStatus("Save failed: " + (e?.message||e));
+                            saveBtn.textContent = "Try again";
+                            }}
+                        }});
+
+                        if (copyBtn) copyBtn.addEventListener("click", async () => {{
+                            try {{
+                            setStatus("Rendering…");
+                            const blob = await getBlob();
+                            setStatus("");
+                            if (navigator.clipboard && window.ClipboardItem) {{
+                                await navigator.clipboard.write([new ClipboardItem({{"image/png": blob}})]);
+                                copyBtn.textContent = "✅ Copied";
+                                setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard", 1600);
+                            }} else {{
+                                setStatus("Clipboard API unavailable; use Save PNG.");
+                            }}
+                            }} catch(e) {{
+                            setStatus("Copy failed: " + (e?.message||e));
+                            copyBtn.textContent = "Try again";
+                            }}
+                        }});
+                        }})();
+                        </script>
+                        """, height=120)
+
+
 
         else:
             # -------- RANGE MODE (new) --------
@@ -2320,7 +2425,7 @@ elif nav == "📈 Equity Curves":
                 if isinstance(dater, tuple) and len(dater) == 2:
                     start_d, end_d = dater
 
-            curve_d = range_cumulative_curve(daily, start_d, end_d)
+            curve_d = range_cumulative_curve(daily, start_d, end_d, daily_sig)
 
             with left_col:
                 if curve_d.empty:
@@ -2419,12 +2524,13 @@ elif nav == "📈 Equity Curves":
                         xaxis_title="Date",
                         yaxis_title="Cumulative P/L ($)",
                         height=600,
-                        margin=dict(l=80, r=50, t=80, b=80),
+                        margin=dict(l=118, r=40, t=80, b=80),
                         plot_bgcolor="#0e1218",
                         paper_bgcolor="#0e1218",
                         font=dict(color="#e9eef7"),
                         showlegend=False,
                     )
+                    fig2.update_yaxes(title_standoff=28, automargin=True)
                     st.plotly_chart(fig2, width="content")
 
             # --- PNG export for range mode (right column), parallel to single-day export ---
@@ -2432,60 +2538,98 @@ elif nav == "📈 Equity Curves":
                 st.markdown("### ")
                 st.markdown("### ")
 
-                do_export2 = st.button(
-                    "Prepare PNG", width="content", key="eq_png_range"
-                )
-                png_bytes2 = None
+                do_export2 = st.button("Prepare PNG", key="eq_png_range")
                 if do_export2 and not curve_d.empty:
-                    try:
-                        fig2_export = go.Figure(fig2)
-                        fig2_export.update_layout(margin=dict(l=120, r=24, t=80, b=80))
-                        fig2_export.update_yaxes(title_standoff=42, automargin=True)
-                        # width/height consistent with single-day for parity
-                        png_bytes2 = fig2_export.to_image(
-                            format="png", scale=2, width=1000, height=600
-                        )
-                    except Exception:
-                        png_bytes2 = None
+                    import json, streamlit.components.v1 as components
+                    from plotly.utils import PlotlyJSONEncoder
+                    fig_obj2 = go.Figure(fig2).to_plotly_json()
+                    fig_json2 = json.dumps(fig_obj2, cls=PlotlyJSONEncoder)
 
-                if png_bytes2:
-                    import base64, streamlit.components.v1 as components
+                    components.html(f"""
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap; padding-bottom:8px">
+                    <button id="saveBtnR" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">💾 Save PNG</button>
+                    <button id="copyBtnR" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">📋 Copy to clipboard</button>
+                    <span id="statusR" style="color:#aab6d3;font-size:12px"></span>
+                    </div>
+                    <div id="offscreen_range" style="position:absolute; left:-99999px; top:-99999px;"></div>
 
-                    b64_2 = base64.b64encode(png_bytes2).decode("ascii")
-                    fname2 = (
-                        f"equity_curve_{start_d.isoformat()}_{end_d.isoformat()}.png"
-                    )
-                    components.html(
-                        f"""<div style="display:flex; flex-direction:column; gap:10px; max-width:220px;">
-                            <button id="saveBtn2" style="padding:10px 14px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;">💾 Save PNG</button>
-                            <button id="copyBtn2" style="padding:10px 14px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;">📋 Copy to clipboard</button>
-                            </div>
-                            <script>(function(){{
-                            const b64="{b64_2}", fname="{fname2}";
-                            async function getBlob(){{const res=await fetch("data:image/png;base64,"+b64);return await res.blob();}}
-                            const saveBtn=document.getElementById("saveBtn2");
-                            if(saveBtn)saveBtn.addEventListener("click",async()=>{{
-                                try{{
-                                const blob=await getBlob();
-                                if(window.showSaveFilePicker){{
-                                    const handle=await window.showSaveFilePicker({{suggestedName:fname,types:[{{description:"PNG Image",accept:{{"image/png":[".png"]}}}}]}});
-                                    const w=await handle.createWritable();await w.write(blob);await w.close();saveBtn.textContent="✅ Saved";setTimeout(()=>saveBtn.textContent="💾 Save PNG",1600);
-                                }}else{{const url=URL.createObjectURL(blob);window.open(url,"_blank");setTimeout(()=>URL.revokeObjectURL(url),5000);}}
-                                }}catch(e){{saveBtn.textContent="Save failed";setTimeout(()=>saveBtn.textContent="💾 Save PNG",1600);}}
+                    <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+                    <script>
+                    (function(){{
+                    const STATUS = document.getElementById("statusR");
+                    function setStatus(t) {{ if (STATUS) {{ STATUS.textContent = t; }} }}
+
+                    const fig = {fig_json2};
+                    const container = document.getElementById("offscreen_range");
+                    const saveBtn = document.getElementById("saveBtnR");
+                    const copyBtn = document.getElementById("copyBtnR");
+
+                    async function ensurePlotlyReady() {{
+                        const maxWait = 2000; const start = performance.now();
+                        while (!window.Plotly) {{
+                        if (performance.now() - start > maxWait) throw new Error("Plotly not loaded");
+                        await new Promise(r=>setTimeout(r,50));
+                        }}
+                    }}
+
+                    async function getBlob() {{
+                        await ensurePlotlyReady();
+                        if (!container.dataset.rendered) {{
+                        await window.Plotly.newPlot(container, fig.data, fig.layout, {{staticPlot:true, displayModeBar:false}});
+                        container.dataset.rendered = "1";
+                        }}
+                        const dataUrl = await window.Plotly.toImage(container, {{format:"png", width:1000, height:600, scale:2}});
+                        const res = await fetch(dataUrl);
+                        return await res.blob();
+                    }}
+
+                    if (saveBtn) saveBtn.addEventListener("click", async () => {{
+                        try {{
+                        setStatus("Rendering…");
+                        const blob = await getBlob();
+                        setStatus("");
+                        if (window.showSaveFilePicker) {{
+                            const handle = await window.showSaveFilePicker({{
+                            suggestedName: "equity_curve_range.png",
+                            types: [{{description:"PNG Image", accept: {{"image/png": [".png"]}}}}]
                             }});
-                            const copyBtn=document.getElementById("copyBtn2");
-                            if(copyBtn)copyBtn.addEventListener("click",async()=>{{
-                                try{{const blob=await getBlob();await navigator.clipboard.write([new ClipboardItem({{"image/png":blob}})]);copyBtn.textContent="✅ Copied";setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard",1600);}}
-                                catch(e){{copyBtn.textContent="Copy failed";setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard",1600);}}
-                            }});
-                            }})();</script>""",
-                        height=130,
-                    )
-                else:
-                    with right_col:
-                        st.caption(
-                            "Tip: Use the camera icon in the chart toolbar to download."
-                        )
+                            const w = await handle.createWritable(); await w.write(blob); await w.close();
+                        }} else {{
+                            const url = URL.createObjectURL(blob);
+                            const a=document.createElement("a");
+                            a.href=url; a.download="equity_curve_range.png"; a.click();
+                            setTimeout(()=>URL.revokeObjectURL(url),5000);
+                        }}
+                        saveBtn.textContent = "✅ Saved"; setTimeout(()=>saveBtn.textContent="💾 Save PNG", 1600);
+                        }} catch(e) {{
+                        setStatus("Save failed: " + (e?.message||e));
+                        saveBtn.textContent = "Try again";
+                        }}
+                    }});
+
+                    if (copyBtn) copyBtn.addEventListener("click", async () => {{
+                        try {{
+                        setStatus("Rendering…");
+                        const blob = await getBlob();
+                        setStatus("");
+                        if (navigator.clipboard && window.ClipboardItem) {{
+                            await navigator.clipboard.write([new ClipboardItem({{"image/png": blob}})]);
+                            copyBtn.textContent = "✅ Copied";
+                            setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard", 1600);
+                        }} else {{
+                            setStatus("Clipboard API unavailable; use Save PNG.");
+                        }}
+                        }} catch(e) {{
+                        setStatus("Copy failed: " + (e?.message||e));
+                        copyBtn.textContent = "Try again";
+                        }}
+                    }});
+                    }})();
+                    </script>
+                    """, height=120)
+
+
+
 
 
 # -------------
@@ -2687,7 +2831,7 @@ elif nav == "📅 Calendar":
                     opacity:.95;
               }
               .cal-month-fee .amt { color:#cfd9e6; }
-              .pl-pos { color: #2e7d32; }
+              .pl-pos { color: #428246; }
               .pl-neg { color: #8b2d2d; }
               .pl-neu { color: #e9eef7; }
 
@@ -2708,11 +2852,11 @@ elif nav == "📅 Calendar":
               .fees { margin-top:2px; font-size:12px; color:#cbd5e1; font-weight:700; }
               .trades { font-size:11px; opacity:.9; margin-top:2px; }
 
-              .pos { background-color:#2e7d32 !important; color:#ecffef !important; }
+              .pos { background-color:#428246 !important; color:#ecffef !important; }
               .pos .daynum,.pos .pnl,.pos .trades,.pos .fees { color:#ecffef !important; }
               .neg { background-color:#8b2d2d !important; color:#ffeaea !important; }
               .neg .daynum,.neg .pnl,.neg .trades,.neg .fees { color:#ffeaea !important; }
-              .hol { background-color:#f5c542 !important; color:#111 !important; }
+              .hol { background-color:#cacfde !important; color:#111 !important; }
               .hol .daynum,.hol .pnl,.hol .trades,.hol .fees { color:#111 !important; }
               .neu { background-color:#162233 !important; color:#e9eef7 !important; }
               .out { background-color:#0d1422 !important; color:#7f8aa1 !important; }
@@ -2721,7 +2865,7 @@ elif nav == "📅 Calendar":
 
               .wsum { font-weight:900; }
               .wsum .fees { font-weight:900; }
-              .wsum.pos { background-color:#2e7d32 !important; color:#ecffef !important; }
+              .wsum.pos { background-color:#428246 !important; color:#ecffef !important; }
               .wsum.neg { background-color:#8b2d2d !important; color:#ffeaea !important; }
               .wsum.neu { background-color:#162233 !important; color:#e9eef7 !important; }
             </style>
@@ -2966,7 +3110,7 @@ else:
                 hole=0.55,
                 color=["Wins", "Losses", "Scratch"],
                 color_discrete_map={
-                    "Wins": "#2e7d32",  # green
+                    "Wins": "#428246",  # green
                     "Losses": "#8b2d2d",  # red
                     "Scratch": "#6b7687",  # neutral gray
                 },
@@ -2994,8 +3138,6 @@ else:
         st.markdown("---")
 
         # ---- Leaders & Laggards section ----
-        st.markdown("### Leaders & Laggards")
-
         sec_left, sec_right = st.columns([1, 1], gap="large")
 
         # LEFT: Top/Bottom tickers
