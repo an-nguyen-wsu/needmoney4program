@@ -40,6 +40,88 @@ except Exception:
 
 
 APP_NAME = "TradeTracker"
+
+# -------------------------
+# Unified Color Theme (fixed)
+# -------------------------
+import re as _re
+
+class Theme:
+    """Single source of truth for all colors; helpers accept palette keys or hex."""
+    palette = {
+        "bg_dark":   "#0f1623",
+        "bg_panel":  "#111825",
+        "ink":       "#cbd5e1",
+        "ink_subtle":"#aab6d3",
+        "white":     "#ffffff",
+        "black":     "#111111",
+        "green":     "#16a34a",   # wins
+        "red":       "#dc2626",   # losses
+        "orange":    "#f59e0b",   # fees
+        "gray":      "#cacfde",
+        "blue":      "#394556",
+    }
+
+    @classmethod
+    def hex(cls, name_or_hex: str) -> str:
+        s = (name_or_hex or "").strip()
+        # palette key
+        if s in cls.palette:
+            return cls.palette[s]
+        # already #RRGGBB
+        if s.startswith("#") and _re.fullmatch(r"#[0-9a-fA-F]{6}", s):
+            return s
+        # bare 6-hex digits -> normalize
+        if _re.fullmatch(r"[0-9a-fA-F]{6}", s):
+            return "#" + s
+        # last resort: return as-is (keeps legacy values working)
+        return s
+
+    @classmethod
+    def rgba(cls, name_or_hex: str, alpha: float) -> str:
+        h = cls.hex(name_or_hex).lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+
+# Back-compat alias used throughout the code
+COL = Theme
+
+def inject_theme_css():
+    """Expose Theme.palette as CSS variables for style blocks."""
+    pal = Theme.palette
+
+    def _rgba(hex_color: str, a: float) -> str:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{a})"
+
+    css = f"""
+    <style>
+      :root {{
+        --bg-dark:   {pal['bg_dark']};
+        --bg-panel:  {pal['bg_panel']};
+        --ink:       {pal['ink']};
+        --ink-subtle:{pal['ink_subtle']};
+        --white:     {pal['white']};
+        --black:     {pal['black']};
+        --green:     {pal['green']};
+        --red:       {pal['red']};
+        --orange:    {pal['orange']};
+        --gray:      {pal['gray']};
+        --blue:      {pal['blue']};
+
+        /* alpha variants */
+        --white-04:  {_rgba(pal['white'], 0.04)};
+        --white-10:  {_rgba(pal['white'], 0.10)};
+        --black-15:  {_rgba(pal['black'], 0.15)};
+        --ink-12:    {_rgba(pal['ink'], 0.12)};
+      }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+
 CONFIG_FILENAME = "config.json"
 
 def _config_path() -> Path:
@@ -68,13 +150,13 @@ def save_user_config(cfg: dict) -> None:
 
 # ---- Device-specific config (env > user-config file > fallback) ----
 _FALLBACKS = {
-    "raw_csvs": r"C:\Users\an\Desktop\Trading\Daily Trade History",
+    "raw_csvs": r"C:\Users\an\Desktop\Trading\VSCode Apps\history",
     "sec_schedule": r"C:\Users\an\Desktop\Trading\VSCode Apps\sec_rate_schedule.csv",
 }
 
 _cfg = load_user_config()
 
-DEFAULT_FOLDER = _cfg.get("raw_csvs", Path("C:/Users/an/Desktop/Trading/Daily Trade History"))
+DEFAULT_FOLDER = _cfg.get("raw_csvs", Path("C:/Users/an/Desktop/Trading/VSCode Apps/history"))
 SEC_RATE_SCHEDULE_PATH_DEFAULT = _cfg.get(
     "sec_schedule",
     Path("C:/Users/an/Desktop/Trading/VSCode Apps/sec_rate_schedule.csv")
@@ -112,6 +194,184 @@ fmt_pct = lambda x: f"{x*100:.1f}%"
 
 
 # --- NEW: tiny helpers for Equity Curves ---
+
+def render_png_export_ui(
+    fig: "go.Figure",
+    key_prefix: str = "single",
+    *,
+    date=None,            # datetime.date|datetime.datetime|str "YYYY-MM-DD"
+    start=None,           # same types as `date`
+    end=None,             # same types as `date`
+    basename: str = "equity",
+):
+    """
+    Save/Copy PNG UI with real Save-As (Chromium) + fallback, and
+    auto filename from the chart's date or date range.
+
+    Filename rules:
+      - if `date` provided  -> {basename}-YYYY-MM-DD.png
+      - elif `start`+`end`  -> {basename}-YYYY-MM-DD_to_YYYY-MM-DD.png
+      - else                -> {basename}-{key_prefix}.png
+    """
+    import json, datetime as _dt
+    import plotly.graph_objects as go
+    import streamlit.components.v1 as components
+    from plotly.utils import PlotlyJSONEncoder
+
+    def _to_date(d):
+        if d is None:
+            return None
+        if isinstance(d, (_dt.date, _dt.datetime)):
+            return d.date() if isinstance(d, _dt.datetime) else d
+        return _dt.date.fromisoformat(str(d))  # accept "YYYY-MM-DD"
+
+    date  = _to_date(date)
+    start = _to_date(start)
+    end   = _to_date(end)
+
+    if date:
+        filename = f"{basename}-{date:%Y-%m-%d}.png"
+    elif start and end:
+        filename = f"{basename}-{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.png"
+    else:
+        filename = f"{basename}-{key_prefix}.png"
+
+    # Serialize fig safely
+    fig_obj = go.Figure(fig).to_plotly_json()
+    fig_json = json.dumps(fig_obj, cls=PlotlyJSONEncoder)
+
+    # Unique element IDs (fixed: no literal braces)
+    save_id = f"saveBtn_{key_prefix}"
+    copy_id = f"copyBtn_{key_prefix}"
+    status_id = f"status_{key_prefix}"
+    offscreen_id = f"offscreen_{key_prefix}"
+
+    # Safe JS string for suggested filename
+    suggested_js = json.dumps(filename)
+
+    components.html(f"""
+    <style>
+      .tt-toolbar {{
+        display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding-bottom:8px;
+      }}
+      .tt-btn {{
+        appearance: none;
+        padding: 8px 12px;
+        border-radius: 10px;
+        font-weight: 600;
+        cursor: pointer;
+        border: 1px solid rgba(125,125,125,.38);
+        background: rgba(127,127,127,.12);
+        color: #222; /* readable in light theme */
+      }}
+      .tt-btn:hover {{ background: rgba(127,127,127,.18); }}
+      .tt-btn:active {{ transform: translateY(1px); }}
+      .tt-status {{ opacity: .85; font-size: 12px; }}
+      @media (prefers-color-scheme: dark) {{
+        .tt-btn {{
+          border-color: rgba(220,220,220,.28);
+          background: rgba(255,255,255,.10);
+          color: #fff; /* readable in dark theme */
+        }}
+        .tt-btn:hover {{ background: rgba(255,255,255,.16); }}
+      }}
+    </style>
+
+    <div class="tt-toolbar">
+      <button id="{save_id}" class="tt-btn">💾 Save PNG</button>
+      <button id="{copy_id}" class="tt-btn">📋 Copy to clipboard</button>
+      <span id="{status_id}" class="tt-status"></span>
+    </div>
+    <div id="{offscreen_id}" style="position:absolute; left:-99999px; top:-99999px;"></div>
+
+    <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+    <script>
+    (function(){{
+      const STATUS = document.getElementById("{status_id}");
+      const container = document.getElementById("{offscreen_id}");
+      const saveBtn = document.getElementById("{save_id}");
+      const copyBtn = document.getElementById("{copy_id}");
+      const suggestedName = {suggested_js};
+      const fig = {fig_json};
+
+      function setStatus(t) {{ if (STATUS) STATUS.textContent = t; }}
+
+      async function ensurePlotlyReady() {{
+        const maxWait = 2500; const start = performance.now();
+        while (!window.Plotly) {{
+          if (performance.now() - start > maxWait) throw new Error("Plotly not loaded");
+          await new Promise(r=>setTimeout(r, 50));
+        }}
+      }}
+
+      async function getBlob() {{
+        await ensurePlotlyReady();
+        if (!container.dataset.rendered) {{
+          await window.Plotly.newPlot(container, fig.data, fig.layout, {{ staticPlot:true, displayModeBar:false }});
+          container.dataset.rendered = "1";
+        }}
+        const dataUrl = await window.Plotly.toImage(container, {{ format:"png", width:1000, height:600, scale:2 }});
+        const res = await fetch(dataUrl);
+        return await res.blob();
+      }}
+
+      async function copyToClipboard() {{
+        try {{
+          setStatus("Rendering...");
+          const blob = await getBlob();
+          if (navigator.clipboard && window.ClipboardItem) {{
+            await navigator.clipboard.write([ new ClipboardItem({{ "image/png": blob }}) ]);
+            setStatus("Copied!");
+            copyBtn.textContent = "✅ Copied";
+            setTimeout(()=>{{ copyBtn.textContent = "📋 Copy to clipboard"; setStatus(""); }}, 1600);
+          }} else {{
+            setStatus("Clipboard API not available");
+          }}
+        }} catch (err) {{
+          console.error(err); setStatus("Copy failed");
+        }}
+      }}
+
+      async function saveAsFile() {{
+        try {{
+          setStatus("Rendering...");
+          const blob = await getBlob();
+
+          if (window.showSaveFilePicker) {{
+            // Chromium/Edge: real OS Save As dialog
+            const handle = await window.showSaveFilePicker({{
+              suggestedName: suggestedName,
+              types: [{{ description: "PNG image", accept: {{ "image/png": [".png"] }} }}],
+            }});
+            const writable = await handle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+          }} else {{
+            // Fallback: anchor download (Firefox/Safari)
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = suggestedName;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+            a.remove();
+          }}
+
+          setStatus("Saved!");
+          saveBtn.textContent = "✅ Saved";
+          setTimeout(()=>{{ saveBtn.textContent = "💾 Save PNG"; setStatus(""); }}, 1600);
+        }} catch (err) {{
+          console.error(err); setStatus("Save failed");
+        }}
+      }}
+
+      if (copyBtn) copyBtn.addEventListener('click', copyToClipboard);
+      if (saveBtn) saveBtn.addEventListener('click', saveAsFile);
+    }})();
+    </script>
+    """, height=170)
+
+
 def _ceil_to_next_15min(ts: pd.Timestamp) -> pd.Timestamp:
     """Round UP to the next 15-min mark (tz-aware)."""
     if pd.isna(ts):
@@ -191,7 +451,6 @@ def _nyse_holidays_year_cached(y: int) -> dict:
 
 @st.cache_data(show_spinner=False)
 def _year_view_html(daily_df: pd.DataFrame, year: int, cols: int = 4, compact: bool = False) -> str:
-
     if daily_df.empty:
         return "<div>No daily stats available for this year.</div>"
 
@@ -222,75 +481,112 @@ def _year_view_html(daily_df: pd.DataFrame, year: int, cols: int = 4, compact: b
     gap_px = 3 if compact else 6
     font_r = 0.68 if compact else 0.78
 
-    # Colors (solid, high-contrast)
-    green = "#16a34a"  # win
-    red   = "#dc2626"  # loss
-    grey= "#cacfde"  # holiday
-    orange = "f59e0b" # fees
+    # (named but not required in CSS vars below)
+    green  = "#16a34a"
+    red    = "#dc2626"
+    orange = "#f59e0b"
 
     css = f"""
-    <style>
-      .yv2-grid {{
-        display:grid;
-        grid-template-columns: repeat({cols}, minmax(0, 1fr));
-        gap:{gap_px + 8}px;
-        margin-top:6px;
-      }}
-      .yv2-month {{
-        display:grid;
-        grid-template-rows: auto 1fr auto;  /* header / calendar / footer */
-        border:1px solid rgba(255,255,255,0.10);
-        border-radius:12px;
-        padding:8px 10px;
-        background:rgba(0,0,0,0.15);
-      }}
-      .yv2-mname {{ text-align:center; font-weight:700; margin-bottom:6px; }}
-      .yv2-cal {{
-        display:grid;
-        grid-template-columns: repeat(7, 1fr);
-        grid-auto-rows: {cell_h}px;         /* uniform rows: 5 or 6 */
-        gap:{gap_px}px;
-      }}
-      .yv2-day {{
-        display:flex; align-items:center; justify-content:center;
-        font-size:{font_r}rem; border-radius:6px;
-      }}
-      .yv2-day.muted {{ background:rgba(255,255,255,0.04); }}
-      .yv2-day.pos   {{ background:{green}; color:#fff; }}
-      .yv2-day.neg   {{ background:{red}; color:#fff; }}
-      .yv2-day.holi  {{ background:{grey}; color:#111; font-weight:700; }}
+        <style>
+        /* Grid of month cards */
+        .yv2-grid {{
+            display: grid;
+            grid-template-columns: repeat({cols}, minmax(0, 1fr));
+            gap: {gap_px + 10}px;
+            margin-top: 8px;
+        }}
 
-      /* footer: left = trades, right = fees + net; single line, never wraps */
-      .yv2-stats {{
-        margin-top:6px;
-        display:grid;
-        grid-template-columns: 1fr auto;
-        column-gap:10px;
-        align-items:center;
-        white-space:nowrap;
-      }}
-      .yv2-stats .right {{ text-align:right; }}
-      .yv2-fee {{ color:{orange}; margin-right:10px; }}
-      .yv2-net.pos {{ color:{green}; font-weight:800; }}
-      .yv2-net.neg {{ color:{red}; font-weight:800; }}
-    </style>
+        /* Month card chrome */
+        .yv2-month {{
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            padding: 0;
+            box-shadow: none;
+        }}
+
+        .yv2-mname {{
+            text-align: center;
+            font-weight: 900;
+            font-size: .95rem;
+            color: var(--ink);
+            margin-bottom: 8px;
+            letter-spacing: .3px;
+        }}
+
+        /* Calendar grid: always 6 weeks (6 x 7 = 42 cells) */
+        .yv2-cal {{
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            grid-template-rows: repeat(6, {cell_h}px);
+            gap: {gap_px}px;
+        }}
+
+        /* Day tiles */
+        .yv2-day {{
+            display: flex; align-items: center; justify-content: center;
+            border-radius: 8px;
+            font-size: {font_r}rem;
+            line-height: 1;
+            border: 1px solid var(--white-10);
+        }}
+
+        /* Day states */
+        .yv2-day.muted {{ background: var(--white-04); color: var(--ink); }}
+        .yv2-day.pos   {{ background: var(--green);   color: var(--white); }}
+        .yv2-day.neg   {{ background: var(--red);     color: var(--white); }}
+        .yv2-day.holi  {{ background: var(--gray);    color: var(--black); font-weight: 800; }}
+
+        /* Footer: left cluster (Profit, Fees) + right cluster (Trades) */
+        .yv2-stats {{
+            display: flex;
+            flex-wrap: nowrap;
+            justify-content: space-between;   /* left cluster vs right cluster */
+            align-items: baseline;            /* align currency digits nicely */
+            padding: 2px 6px 0 6px;
+            font-variant-numeric: tabular-nums;
+            min-height: 22px;                 /* reserves space for consistent height */
+            gap: 0;                           /* gaps are set on inner clusters */
+        }}
+
+        .yv2-stats .left {{
+            display: flex;
+            align-items: baseline;
+            gap: 12px;                        /* spacing between Profit and Fees */
+        }}
+
+        .yv2-stats .right {{
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+        }}
+
+        /* Typography + colors for footer values */
+        .yv2-net {{ font-weight: 700; }}          /* Profit bold */
+        .yv2-net.pos {{ color:#2e7d32; }}
+        .yv2-net.neg {{ color:#d9534f; }}
+
+        .yv2-fee {{ color:#ff8c00; font-weight: 400; }}   /* Fees normal */
+        .yv2-trades {{ color: var(--ink-subtle); font-weight: 400; white-space: nowrap; }}  /* Trades normal, on right */
+        </style>
     """
 
     def _fmt(x: float) -> str:
         return f"${x:,.2f}"
 
     months_html = []
-    for m in range(1, 13):
+    for m in range(1, 12 + 1):
         mname = _dt.date(year, m, 1).strftime("%B")
 
         # Sunday-first grid with leading blanks
-        def _sunfirst(w): return (w + 1) % 7  # Mon=0..Sun=6 -> Sun=0..Sat=6
+        def _sunfirst(w): return (w + 1) % 7
         lead = _sunfirst(_dt.date(year, m, 1).weekday())
         _, ndays = monthrange(year, m)
 
         cells = []
         for _ in range(lead):
             cells.append('<div class="yv2-day muted"></div>')
+
         for daynum in range(1, ndays + 1):
             dt = _dt.date(year, m, daynum)
             klass = ["yv2-day"]
@@ -301,22 +597,33 @@ def _year_view_html(daily_df: pd.DataFrame, year: int, cols: int = 4, compact: b
             elif dt in neg_days:
                 klass.append("neg")
             else:
-                klass.append("muted")  # neutral day (no trading)
+                klass.append("muted")
             title = holinames.get(dt, "")
             cells.append(f'<div class="{" ".join(klass)}" title="{title}">{daynum}</div>')
 
+        # Pad trailing blanks to 42 cells (6 rows x 7 cols)
+        pad = 42 - len(cells)
+        if pad > 0:
+            cells.extend(['<div class="yv2-day muted"></div>'] * pad)
+
         cal_html = f'<div class="yv2-cal">{"".join(cells)}</div>'
 
-        # Stats
+        # Monthly aggregates
         net   = float(month_sum.loc[m, "net"])   if m in month_sum.index else 0.0
         fees  = float(month_sum.loc[m, "fees"])  if m in month_sum.index else 0.0
-        trs   = int(month_sum.loc[m, "trades"]) if m in month_sum.index else 0
+        trs   = int(month_sum.loc[m, "trades"])  if m in month_sum.index else 0
         net_cls = "pos" if net >= 0 else "neg"
+
+        # Footer: Profit & Fees on the left, Trades on the right
         stats_html = (
             f'<div class="yv2-stats">'
-            f'  <div class="left">{trs:,} trades</div>'
-            f'  <div class="right"><span class="yv2-fee">{_fmt(fees)}</span>'
-            f'  <span class="yv2-net {net_cls}">{_fmt(net)}</span></div>'
+            f'  <div class="left">'
+            f'    <span class="yv2-net {net_cls}">{_fmt(net)}</span>'
+            f'    <span class="yv2-fee">{_fmt(fees)}</span>'
+            f'  </div>'
+            f'  <div class="right">'
+            f'    <span class="yv2-trades">{trs:,} trades</span>'
+            f'  </div>'
             f'</div>'
         )
 
@@ -583,7 +890,11 @@ def _load_all_trades_daily_from_cache(folder: Path) -> tuple[pd.DataFrame, pd.Da
     if tdir.exists():
         for fp in sorted(tdir.glob("*.parquet")):
             try:
-                df = pd.read_parquet(fp)
+                try:
+                    df = pd.read_parquet(fp, columns=trades_cols)
+                except Exception:
+                    # Newer shards may omit some columns (e.g., trade_id). Read all and align later.
+                    df = pd.read_parquet(fp)
                 if not isinstance(df, pd.DataFrame):
                     continue
                 trades_frames.append(df)
@@ -595,7 +906,7 @@ def _load_all_trades_daily_from_cache(folder: Path) -> tuple[pd.DataFrame, pd.Da
     if sdir.exists():
         for fp in sorted(sdir.glob("*.parquet")):
             try:
-                df = pd.read_parquet(fp)
+                df = pd.read_parquet(fp, columns=daily_cols)
                 if not isinstance(df, pd.DataFrame):
                     continue
                 stats_frames.append(df)
@@ -620,6 +931,13 @@ def _load_all_trades_daily_from_cache(folder: Path) -> tuple[pd.DataFrame, pd.Da
             trades["entry_time"] = pd.to_datetime(trades["entry_time"], errors="coerce")
         if "exit_time" in trades and not pd.api.types.is_datetime64_any_dtype(trades["exit_time"]):
             trades["exit_time"] = pd.to_datetime(trades["exit_time"], errors="coerce")
+
+        # Compact dtypes to save RAM and speed df ops
+        if "symbol" in trades:
+            trades["symbol"] = trades["symbol"].astype("category")
+        if "direction" in trades:
+            trades["direction"] = trades["direction"].astype("category")
+
 
         # Stable global ordering, then unique IDs
         sort_cols = [c for c in ["entry_time", "symbol", "exit_time", "shares"] if c in trades.columns]
@@ -691,6 +1009,10 @@ def read_single_fidelity_csv(path: Path) -> pd.DataFrame:
     header = rows[0]
     data_rows = rows[1:]
     df = pd.DataFrame(data_rows, columns=header)
+    # Normalize friend’s schema: prefer 'Trade Type'
+    if "Order Type" in df.columns and "Trade Type" not in df.columns:
+        df = df.rename(columns={"Order Type": "Trade Type"})
+
     # Some files may contain trailing empty rows
     return df.dropna(how="all").reset_index(drop=True)
 
@@ -734,7 +1056,7 @@ def load_all_raw(folder: Path, sig: Tuple[Tuple[str, float, int], ...]) -> pd.Da
 
     # ---- Memory/CPU optimizations (behavior-preserving) ----
     # Convert frequently-repeated text columns to categoricals
-    cat_cols = ["Symbol", "Status", "Trade Description", "Trade Type"]
+    cat_cols = ["Symbol", "Status", "Trade Description", "Trade Type", "Order Type"]
     for c in cat_cols:
         if c in out.columns:
             out[c] = out[c].astype("category")
@@ -869,14 +1191,22 @@ def raw_to_fills(raw: pd.DataFrame, sec_schedule: pd.DataFrame) -> pd.DataFrame:
 
     df["side"] = side
 
-    # --- Quantity ---
-    qty = (
-        df["Quantity"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .str.extract(r"(-?\d+)", expand=False)
-    )
-    df["quantity"] = pd.to_numeric(qty, errors="coerce").fillna(0).astype(int)
+    # --- Quantity (support both schemas) ---
+    if "Quantity" in df.columns and df["Quantity"].notna().any():
+        qsrc = df["Quantity"].astype(str).str.replace(",", "", regex=False)
+        qty = qsrc.str.extract(r"(-?\d+)", expand=False)
+    else:
+        # Friend's CSV: quantity is embedded in Trade Description, e.g. "Sell 4100 at Market"
+        desc = df["Trade Description"].astype(str).str.lower().str.replace(",", "", regex=False)
+
+        # Primary: number right after side verb (handles: sell short / buy to cover / buy / sell)
+        qty = desc.str.extract(r"(?:sell short|buy to cover|buy|sell)\s+(-?\d+)\b", expand=False)
+
+        # Fallback: last integer in the string (belt & suspenders)
+        qty = qty.fillna(desc.str.extract(r"(-?\d+)\b(?!.*\d)", expand=False))
+
+    df["quantity"] = pd.to_numeric(qty, errors="coerce").astype("Int64")
+
 
     # --- Timestamp: "hh:mm:ss AM\nMM/DD/YYYY" (Eastern) → Pacific ---
     ts_src = df["Order Time"].astype(str)
@@ -1253,10 +1583,6 @@ def compute_daily_stats(
 # -------------------------
 # Calendar utilities
 # -------------------------
-@st.cache_data(show_spinner=False)
-def _nyse_holidays_year_cached(y: int) -> dict[date, str]:
-    return nyse_holidays_named(date(y, 1, 1), date(y, 12, 31))
-
 
 def nyse_holidays_named(start_dt: date, end_dt: date) -> dict[date, str]:
     names: dict[date, str] = {}
@@ -1299,6 +1625,60 @@ def nyse_holidays_named(start_dt: date, end_dt: date) -> dict[date, str]:
                 names[dd] = US_HOL.get(dd, "Market Holiday")
 
     return names
+
+# ---- Unified trading-day helpers ----
+def _today_pacific() -> date:
+    return datetime.now(TIMEZONE_PACIFIC).date()
+
+def _month_end(d: date) -> date:
+    # last calendar day of that month
+    from calendar import monthrange
+    return date(d.year, d.month, monthrange(d.year, d.month)[1])
+
+def trading_days_between(start_d: date, end_d: date) -> int:
+    """
+    Count market TRADING days (NYSE) between start_d and end_d inclusive.
+    Prefers pandas_market_calendars if available; otherwise falls back to
+    weekdays minus known/derived closures.
+    """
+    if end_d < start_d:
+        return 0
+
+    # Best: use NYSE schedule if pandas_market_calendars (mcal) is available
+    if mcal is not None:
+        try:
+            cal = mcal.get_calendar("XNYS")
+        except Exception:
+            try:
+                cal = mcal.get_calendar("NYSE")
+            except Exception:
+                cal = None
+        if cal is not None:
+            try:
+                sched = cal.schedule(start_date=start_d, end_date=end_d)
+                return int(len(sched.index))
+            except Exception:
+                pass  # fall through to weekday/holiday logic
+
+    # Fallback: weekdays minus closures from our holiday/closure map
+    closed = set(nyse_holidays_named(start_d, end_d).keys())
+
+    # Ensure Good Friday is excluded even if holidays lib lacks it
+    try:
+        from dateutil.easter import easter as _easter
+        for y in range(start_d.year, end_d.year + 1):
+            gf = _easter(y) - timedelta(days=2)
+            if start_d <= gf <= end_d and gf.weekday() < 5:
+                closed.add(gf)
+    except Exception:
+        pass
+
+    return sum(
+        1
+        for n in range((end_d - start_d).days + 1)
+        if (start_d + timedelta(days=n)).weekday() < 5
+        and (start_d + timedelta(days=n)) not in closed
+    )
 
 
 def build_month_grid(year: int, month: int) -> List[List[date]]:
@@ -1374,6 +1754,7 @@ def _sec_rate_help_from_csv(path_guess: str) -> str:
 # -------------------------
 
 st.set_page_config(page_title="Trade Tracker", layout="wide")
+inject_theme_css()
 
 
 # Sidebar title (compact, above navigation)
@@ -1550,6 +1931,16 @@ def _build_trades_display_cached(trades_df: pd.DataFrame) -> pd.DataFrame:
 # --- Precompute Trade Log display fields once per run ---
 _trades_disp = _build_trades_display_cached(trades)
 
+@st.cache_data(show_spinner=False)
+def _sorted_trades_display(view_sig: tuple, view_df: pd.DataFrame) -> pd.DataFrame:
+    # view_sig should reflect the number of rows & last trade id (or date)
+    if view_df.empty:
+        return view_df
+    return view_df.sort_values("trade_id", ascending=False, kind="stable")
+
+# lightweight signature so cache invalidates when trades change
+_view_sig = (int(len(_trades_disp)), _trades_disp["trade_id"].max() if not _trades_disp.empty else -1)
+_trades_disp = _sorted_trades_display(_view_sig, _trades_disp)
 
 
 # Sidebar: Exports (only after trades/daily exist)
@@ -1580,6 +1971,29 @@ with st.sidebar:
 # -------------
 # Trade Log tab
 # -------------
+
+@st.cache_data(show_spinner=False)
+def summarize_daily_window_kpis(daily_slice: pd.DataFrame) -> dict:
+    """Return KPIs for a slice of the daily stats DataFrame."""
+    if daily_slice.empty:
+        return dict(net=0.0, fees=0.0, trades=0, wins=0, losses=0, win_rate=0.0, profit_factor=np.nan)
+    net = float(daily_slice.get("daily_profit", pd.Series(dtype=float)).sum())
+    fees = float(daily_slice.get("fees", pd.Series(dtype=float)).sum()) if "fees" in daily_slice.columns else 0.0
+    trades = int(daily_slice.get("num_trades", pd.Series(dtype=int)).sum()) if "num_trades" in daily_slice.columns else 0
+    wins = int(daily_slice.get("wins", pd.Series(dtype=int)).sum()) if "wins" in daily_slice.columns else int(0)
+    losses = int(daily_slice.get("losses", pd.Series(dtype=int)).sum()) if "losses" in daily_slice.columns else int(0)
+    # Win rate: compute from sum of wins/trades to avoid recomputing per day
+    win_rate = (wins / trades) if trades else 0.0
+    # Profit factor: safe combine if available; else np.nan
+    if "gross_profit" in daily_slice.columns and "gross_loss" in daily_slice.columns:
+        gp = float(daily_slice["gross_profit"].sum())
+        gl = float(daily_slice["gross_loss"].sum())
+        pf = (gp / gl) if gl > 0 else np.nan
+    else:
+        pf = np.nan
+    return dict(net=net, fees=fees, trades=trades, wins=wins, losses=losses, win_rate=win_rate, profit_factor=pf)
+
+
 if nav == "📒 Trade Log":
     st.subheader("📒 Trade Log")
 
@@ -1626,9 +2040,6 @@ if nav == "📒 Trade Log":
                 "No trades parsed yet. Add CSV files to your folder or adjust settings."
             )
         else:
-            # Sort newest first without reformatting anything
-            view = view.sort_values("trade_id", ascending=False, kind="stable")
-
             # Build display from precomputed fields (no copies, no tz work here)
             display = view.loc[
                 :,
@@ -1987,9 +2398,9 @@ elif nav == "🎉 Year View":
               /* KPI line */
               .yv-line { display:flex; align-items:center; gap:18px; }  /* space between YTD and Fees */
               .yv-kpi  { font-weight:700; }
-              .yv-pos  { color:#16a34a; font-weight:800; }  /* YTD >= 0 */
-              .yv-neg  { color:#dc2626; font-weight:800; }  /* YTD <  0 */
-              .yv-fee  { color:#f59e0b; font-weight:700; }  /* Fees orange */
+              .yv-pos  { color:var(--green); font-weight:800; }  /* YTD >= 0 */
+              .yv-neg  { color:var(--red); font-weight:800; }  /* YTD <  0 */
+              .yv-fee  { color:var(--orange); font-weight:700; }  /* Fees orange */
               .yv-right { text-align:right; }
             </style>
             """,
@@ -2012,28 +2423,18 @@ elif nav == "🎉 Year View":
 
         # Slice for chosen year and compute KPIs
         ydf = d[d["dts"].dt.year == year].copy()
-        ytd_net    = float(ydf["daily_profit"].sum()) if not ydf.empty else 0.0
-        ytd_fees   = float(ydf["fees"].sum())         if "fees" in ydf.columns else 0.0
-        ytd_trades = int(ydf["num_trades"].sum())     if "num_trades" in ydf.columns else 0
+        _kpis = summarize_daily_window_kpis(ydf)
+        ytd_net, ytd_fees, ytd_trades = _kpis["net"], _kpis["fees"], _kpis["trades"]
 
-        # Trading days remaining in selected year (Mon–Fri, exclude NYSE holidays)
-        today = datetime.now(TIMEZONE_PACIFIC).date()
+        # Trading days remaining in selected year (uses unified helper)
+        today = _today_pacific()
         if year < today.year:
             trading_days_left = 0
         else:
-            start = today if year == today.year else date(year, 1, 1)
+            start = (today + timedelta(days=1)) if year == today.year else date(year, 1, 1)
             end   = date(year, 12, 31)
-            try:
-                holi_map = _nyse_holidays_year_cached(year)  # {date: "Holiday"}
-            except Exception:
-                holi_map = nyse_holidays_named(date(year, 1, 1), date(year, 12, 31))
-            holi_days = set(holi_map.keys())
-            trading_days_left = sum(
-                1
-                for n in range((end - start).days + 1)
-                if (start + timedelta(days=n)).weekday() < 5
-                and (start + timedelta(days=n)) not in holi_days
-            )
+            trading_days_left = trading_days_between(start, end)
+
 
         # KPIs: YTD (colored) + Fees (orange) + Trades — one line, centered block
         net_cls = "yv-pos" if ytd_net >= 0 else "yv-neg"
@@ -2130,11 +2531,7 @@ elif nav == "📈 Equity Curves":
 
             # --- Mode switcher ---
             if st.session_state.eq_mode == "single":
-                # Single-day selector (existing behavior)
-                # Build available days before using them here:
-
-                latest_day = trade_days[-1]
-
+                # Single-day selector
                 sel_day = st.date_input(
                     "Date",
                     value=latest_day,
@@ -2145,9 +2542,7 @@ elif nav == "📈 Equity Curves":
                 )
 
                 st.markdown("### ")
-                make_range = st.button(
-                    "Choose custom time range", width="content"
-                )
+                make_range = st.button("Choose custom time range", width="content")
                 if make_range:
                     st.session_state.eq_mode = "range"
                     st.rerun()
@@ -2192,10 +2587,10 @@ elif nav == "📈 Equity Curves":
 
         if st.session_state.eq_mode == "single":
             # -------- SINGLE-DAY (existing behavior) --------
-            # Use the already-picked date from session state
             sel_day = st.session_state.get("eq_single_date")
 
-            curve = daily_running_curve(trades, sel_day, trades_sig) # cached
+            # cached
+            curve = daily_running_curve(trades, sel_day, trades_sig)
 
             # Guard (no trades that day) -> flat line
             if curve.shape[0] == 2 and curve["equity"].abs().sum() == 0:
@@ -2248,7 +2643,7 @@ elif nav == "📈 Equity Curves":
                         x=x,
                         y=y,
                         mode="lines",
-                        line=dict(width=3, color="#ffffff", shape="linear"),
+                        line=dict(width=3, color=COL.hex("white"), shape="linear"),
                         name="Running P/L",
                     )
                 )
@@ -2314,108 +2709,98 @@ elif nav == "📈 Equity Curves":
                 with left_col:
                     st.plotly_chart(fig, width=False)
 
-                # ----- (keep your existing PNG export block here, unchanged) -----
-                # Reuse the same export UI below the single-day chart:
+                # ----- PNG export for single-day -----
                 with right_col:
                     st.markdown("### ")
                     st.markdown("### ")
-                    
                     do_export = st.button("Prepare PNG", key="eq_png_single")
                     if do_export:
-                        import json, streamlit.components.v1 as components
-                        from plotly.utils import PlotlyJSONEncoder
-                        # Make a pure JSON object literal (not a string)
-                        fig_obj = go.Figure(fig).to_plotly_json()
-                        fig_json = json.dumps(fig_obj, cls=PlotlyJSONEncoder)
-
-                        components.html(f"""
-                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap; padding-bottom:8px">
-                        <button id="saveBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">💾 Save PNG</button>
-                        <button id="copyBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">📋 Copy to clipboard</button>
-                        <span id="status" style="color:#aab6d3;font-size:12px"></span>
-                        </div>
-                        <div id="offscreen_single" style="position:absolute; left:-99999px; top:-99999px;"></div>
-
-                        <!-- Load Plotly INSIDE the iframe -->
-                        <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-                        <script>
-                        (function(){{
-                        const STATUS = document.getElementById("status");
-                        function setStatus(t) {{ if (STATUS) {{ STATUS.textContent = t; }} }}
-
-                        const fig = {fig_json}; // this is a real object literal
-                        const container = document.getElementById("offscreen_single");
-                        const saveBtn = document.getElementById("saveBtn");
-                        const copyBtn = document.getElementById("copyBtn");
-
-                        async function ensurePlotlyReady() {{
-                            // Wait until Plotly is available in this iframe
-                            const maxWait = 2000; const start = performance.now();
-                            while (!window.Plotly) {{
-                            if (performance.now() - start > maxWait) throw new Error("Plotly not loaded");
-                            await new Promise(r=>setTimeout(r,50));
-                            }}
-                        }}
-
-                        async function getBlob() {{
-                            await ensurePlotlyReady();
-                            if (!container.dataset.rendered) {{
-                            await window.Plotly.newPlot(container, fig.data, fig.layout, {{staticPlot:true, displayModeBar:false}});
-                            container.dataset.rendered = "1";
-                            }}
-                            const dataUrl = await window.Plotly.toImage(container, {{format:"png", width:1000, height:600, scale:2}});
-                            const res = await fetch(dataUrl);
-                            return await res.blob();
-                        }}
-
-                        if (saveBtn) saveBtn.addEventListener("click", async () => {{
-                            try {{
-                            setStatus("Rendering…");
-                            const blob = await getBlob();
-                            setStatus("");
-                            if (window.showSaveFilePicker) {{
-                                const handle = await window.showSaveFilePicker({{
-                                suggestedName: "equity_curve_{pd.Timestamp(sel_day).date().isoformat()}.png",
-                                types: [{{description:"PNG Image", accept: {{"image/png": [".png"]}}}}]
-                                }});
-                                const w = await handle.createWritable(); await w.write(blob); await w.close();
-                            }} else {{
-                                const url = URL.createObjectURL(blob);
-                                const a=document.createElement("a");
-                                a.href=url; a.download="equity_curve.png"; a.click();
-                                setTimeout(()=>URL.revokeObjectURL(url),5000);
-                            }}
-                            saveBtn.textContent = "✅ Saved"; setTimeout(()=>saveBtn.textContent="💾 Save PNG", 1600);
-                            }} catch(e) {{
-                            setStatus("Save failed: " + (e?.message||e));
-                            saveBtn.textContent = "Try again";
-                            }}
-                        }});
-
-                        if (copyBtn) copyBtn.addEventListener("click", async () => {{
-                            try {{
-                            setStatus("Rendering…");
-                            const blob = await getBlob();
-                            setStatus("");
-                            if (navigator.clipboard && window.ClipboardItem) {{
-                                await navigator.clipboard.write([new ClipboardItem({{"image/png": blob}})]);
-                                copyBtn.textContent = "✅ Copied";
-                                setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard", 1600);
-                            }} else {{
-                                setStatus("Clipboard API unavailable; use Save PNG.");
-                            }}
-                            }} catch(e) {{
-                            setStatus("Copy failed: " + (e?.message||e));
-                            copyBtn.textContent = "Try again";
-                            }}
-                        }});
-                        }})();
-                        </script>
-                        """, height=120)
-
-
+                        render_png_export_ui(fig, key_prefix="single", date=sel_day, basename="equity")
 
         else:
+            # ===== Cached builder for RANGE charts (build-on-demand) =====
+            @st.cache_data(show_spinner=False)
+            def _build_range_equity_fig(_curve_df: pd.DataFrame, start_d: date, end_d: date, col_hex_white: str) -> go.Figure:
+                # _curve_df columns expected: ["date", "equity"] from range_cumulative_curve(...)
+                if _curve_df is None or _curve_df.empty:
+                    return go.Figure()
+
+                y2 = _curve_df["equity"]
+                x2 = _curve_df["date"]
+                net_pl_range = float(y2.iloc[-1])
+                y2_pos, y2_neg = y2.clip(lower=0), y2.clip(upper=0)
+
+                fig2 = go.Figure()
+                # green fill above 0
+                fig2.add_trace(
+                    go.Scatter(
+                        x=x2, y=y2_pos, mode="lines",
+                        line=dict(width=0, shape="linear"),
+                        fill="tozeroy", hoverinfo="skip",
+                        fillcolor="rgba(46,125,50,0.55)", showlegend=False,
+                    )
+                )
+                # red fill below 0
+                fig2.add_trace(
+                    go.Scatter(
+                        x=x2, y=y2_neg, mode="lines",
+                        line=dict(width=0, shape="linear"),
+                        fill="tozeroy", hoverinfo="skip",
+                        fillcolor="rgba(139,45,45,0.55)", showlegend=False,
+                    )
+                )
+                # white line on top
+                fig2.add_trace(
+                    go.Scatter(
+                        x=x2, y=y2, mode="lines",
+                        line=dict(width=3, color=col_hex_white, shape="linear"),
+                        name="Cumulative P/L",
+                    )
+                )
+
+                # annotate high/low (safe for duplicate indices)
+                y2_max, y2_min = float(y2.max()), float(y2.min())
+                if y2_max != y2_min:
+                    imax, imin = y2.idxmax(), y2.idxmin()
+
+                    x2_max = x2.loc[imax]
+                    x2_min = x2.loc[imin]
+                    y2_max = float(y2.loc[imax])
+                    y2_min = float(y2.loc[imin])
+
+                    if isinstance(x2_max, pd.Series):
+                        x2_max = x2_max.iloc[0]
+                        y2_max = float(y2.loc[imax].iloc[0])
+                    if isinstance(x2_min, pd.Series):
+                        x2_min = x2_min.iloc[0]
+                        y2_min = float(y2.loc[imin].iloc[0])
+
+                    fig2.add_annotation(
+                        x=x2_max, y=y2_max, text=f"High: ${y2_max:,.0f}",
+                        showarrow=True, arrowhead=2, yshift=10,
+                        bgcolor="rgba(0,0,0,0.5)",
+                    )
+                    fig2.add_annotation(
+                        x=x2_min, y=y2_min, text=f"Low: ${y2_min:,.0f}",
+                        showarrow=True, arrowhead=2, yshift=-10,
+                        bgcolor="rgba(0,0,0,0.5)",
+                    )
+
+                title_txt = f"{start_d.strftime('%b %d, %Y')} → {end_d.strftime('%b %d, %Y')}"
+                fig2.update_layout(
+                    title=dict(text=f"Cumulative P/L — {title_txt}  (Net: ${net_pl_range:,.0f})", x=0.5, xanchor="center"),
+                    xaxis_title="Date",
+                    yaxis_title="Cumulative P/L ($)",
+                    height=600,
+                    margin=dict(l=118, r=40, t=80, b=80),
+                    plot_bgcolor="#0e1218",
+                    paper_bgcolor="#0e1218",
+                    font=dict(color="#e9eef7"),
+                    showlegend=False,
+                )
+                fig2.update_yaxes(title_standoff=28, automargin=True)
+                return fig2
+
             # -------- RANGE MODE (new) --------
             preset = st.session_state.get("eq_range_preset", "Year to date")
             start_d, end_d = _preset_dates(preset)
@@ -2425,210 +2810,24 @@ elif nav == "📈 Equity Curves":
                 if isinstance(dater, tuple) and len(dater) == 2:
                     start_d, end_d = dater
 
+            # Build the cumulative curve dataframe (cached upstream)
             curve_d = range_cumulative_curve(daily, start_d, end_d, daily_sig)
 
             with left_col:
                 if curve_d.empty:
                     st.info("No days in the selected range.")
                 else:
-                    # Build shaded cumulative equity curve with centered title + Net
-                    title_txt = f"{start_d.strftime('%b %d, %Y')} → {end_d.strftime('%b %d, %Y')}"
-                    y2 = curve_d["equity"]
-                    x2 = curve_d["date"]
-
-                    net_pl_range = float(y2.iloc[-1])
-                    y2_pos, y2_neg = y2.clip(lower=0), y2.clip(upper=0)
-
-                    fig2 = go.Figure()
-                    # green fill above 0
-                    fig2.add_trace(
-                        go.Scatter(
-                            x=x2,
-                            y=y2_pos,
-                            mode="lines",
-                            line=dict(width=0, shape="linear"),
-                            fill="tozeroy",
-                            hoverinfo="skip",
-                            fillcolor="rgba(46,125,50,0.55)",
-                            showlegend=False,
-                        )
-                    )
-                    # red fill below 0
-                    fig2.add_trace(
-                        go.Scatter(
-                            x=x2,
-                            y=y2_neg,
-                            mode="lines",
-                            line=dict(width=0, shape="linear"),
-                            fill="tozeroy",
-                            hoverinfo="skip",
-                            fillcolor="rgba(139,45,45,0.55)",
-                            showlegend=False,
-                        )
-                    )
-                    # white line on top
-                    fig2.add_trace(
-                        go.Scatter(
-                            x=x2,
-                            y=y2,
-                            mode="lines",
-                            line=dict(width=3, color="#ffffff", shape="linear"),
-                            name="Cumulative P/L",
-                        )
-                    )
-
-                    # Optional: annotate high/low for the range
-                    y2_max, y2_min = float(y2.max()), float(y2.min())
-                    imax, imin = y2.idxmax(), y2.idxmin()
-
-                    # Use .loc (label-based) to avoid .iloc out-of-bounds with non-zero-based indices
-                    x2_max = x2.loc[imax]
-                    x2_min = x2.loc[imin]
-                    y2_max = float(y2.loc[imax])
-                    y2_min = float(y2.loc[imin])
-
-                    # If your index ever has duplicates, .loc returns a Series; take the first value
-                    if isinstance(x2_max, pd.Series):
-                        x2_max = x2_max.iloc[0]
-                        y2_max = float(y2.loc[imax].iloc[0])
-                    if isinstance(x2_min, pd.Series):
-                        x2_min = x2_min.iloc[0]
-                        y2_min = float(y2.loc[imin].iloc[0])
-
-                    if y2_max != y2_min:
-                        fig2.add_annotation(
-                            x=x2_max,
-                            y=y2_max,
-                            text=f"High: ${y2_max:,.0f}",
-                            showarrow=True,
-                            arrowhead=2,
-                            yshift=10,
-                            bgcolor="rgba(0,0,0,0.5)",
-                        )
-                        fig2.add_annotation(
-                            x=x2_min,
-                            y=y2_min,
-                            text=f"Low: ${y2_min:,.0f}",
-                            showarrow=True,
-                            arrowhead=2,
-                            yshift=-10,
-                            bgcolor="rgba(0,0,0,0.5)",
-                        )
-
-                    fig2.update_layout(
-                        title=dict(
-                            text=f"Cumulative P/L — {title_txt}  (Net: ${net_pl_range:,.0f})",
-                            x=0.5,
-                            xanchor="center",
-                        ),
-                        xaxis_title="Date",
-                        yaxis_title="Cumulative P/L ($)",
-                        height=600,
-                        margin=dict(l=118, r=40, t=80, b=80),
-                        plot_bgcolor="#0e1218",
-                        paper_bgcolor="#0e1218",
-                        font=dict(color="#e9eef7"),
-                        showlegend=False,
-                    )
-                    fig2.update_yaxes(title_standoff=28, automargin=True)
+                    # Build-on-demand cached figure
+                    fig2 = _build_range_equity_fig(curve_d, start_d, end_d, COL.hex("white"))
                     st.plotly_chart(fig2, width="content")
 
             # --- PNG export for range mode (right column), parallel to single-day export ---
             with right_col:
                 st.markdown("### ")
                 st.markdown("### ")
-
                 do_export2 = st.button("Prepare PNG", key="eq_png_range")
                 if do_export2 and not curve_d.empty:
-                    import json, streamlit.components.v1 as components
-                    from plotly.utils import PlotlyJSONEncoder
-                    fig_obj2 = go.Figure(fig2).to_plotly_json()
-                    fig_json2 = json.dumps(fig_obj2, cls=PlotlyJSONEncoder)
-
-                    components.html(f"""
-                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap; padding-bottom:8px">
-                    <button id="saveBtnR" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">💾 Save PNG</button>
-                    <button id="copyBtnR" style="padding:8px 12px;border-radius:8px;border:1px solid #3b4454;background:#1b2330;color:#e9eef7;font-weight:600;cursor:pointer;">📋 Copy to clipboard</button>
-                    <span id="statusR" style="color:#aab6d3;font-size:12px"></span>
-                    </div>
-                    <div id="offscreen_range" style="position:absolute; left:-99999px; top:-99999px;"></div>
-
-                    <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-                    <script>
-                    (function(){{
-                    const STATUS = document.getElementById("statusR");
-                    function setStatus(t) {{ if (STATUS) {{ STATUS.textContent = t; }} }}
-
-                    const fig = {fig_json2};
-                    const container = document.getElementById("offscreen_range");
-                    const saveBtn = document.getElementById("saveBtnR");
-                    const copyBtn = document.getElementById("copyBtnR");
-
-                    async function ensurePlotlyReady() {{
-                        const maxWait = 2000; const start = performance.now();
-                        while (!window.Plotly) {{
-                        if (performance.now() - start > maxWait) throw new Error("Plotly not loaded");
-                        await new Promise(r=>setTimeout(r,50));
-                        }}
-                    }}
-
-                    async function getBlob() {{
-                        await ensurePlotlyReady();
-                        if (!container.dataset.rendered) {{
-                        await window.Plotly.newPlot(container, fig.data, fig.layout, {{staticPlot:true, displayModeBar:false}});
-                        container.dataset.rendered = "1";
-                        }}
-                        const dataUrl = await window.Plotly.toImage(container, {{format:"png", width:1000, height:600, scale:2}});
-                        const res = await fetch(dataUrl);
-                        return await res.blob();
-                    }}
-
-                    if (saveBtn) saveBtn.addEventListener("click", async () => {{
-                        try {{
-                        setStatus("Rendering…");
-                        const blob = await getBlob();
-                        setStatus("");
-                        if (window.showSaveFilePicker) {{
-                            const handle = await window.showSaveFilePicker({{
-                            suggestedName: "equity_curve_range.png",
-                            types: [{{description:"PNG Image", accept: {{"image/png": [".png"]}}}}]
-                            }});
-                            const w = await handle.createWritable(); await w.write(blob); await w.close();
-                        }} else {{
-                            const url = URL.createObjectURL(blob);
-                            const a=document.createElement("a");
-                            a.href=url; a.download="equity_curve_range.png"; a.click();
-                            setTimeout(()=>URL.revokeObjectURL(url),5000);
-                        }}
-                        saveBtn.textContent = "✅ Saved"; setTimeout(()=>saveBtn.textContent="💾 Save PNG", 1600);
-                        }} catch(e) {{
-                        setStatus("Save failed: " + (e?.message||e));
-                        saveBtn.textContent = "Try again";
-                        }}
-                    }});
-
-                    if (copyBtn) copyBtn.addEventListener("click", async () => {{
-                        try {{
-                        setStatus("Rendering…");
-                        const blob = await getBlob();
-                        setStatus("");
-                        if (navigator.clipboard && window.ClipboardItem) {{
-                            await navigator.clipboard.write([new ClipboardItem({{"image/png": blob}})]);
-                            copyBtn.textContent = "✅ Copied";
-                            setTimeout(()=>copyBtn.textContent="📋 Copy to clipboard", 1600);
-                        }} else {{
-                            setStatus("Clipboard API unavailable; use Save PNG.");
-                        }}
-                        }} catch(e) {{
-                        setStatus("Copy failed: " + (e?.message||e));
-                        copyBtn.textContent = "Try again";
-                        }}
-                    }});
-                    }})();
-                    </script>
-                    """, height=120)
-
-
+                    render_png_export_ui(fig2, key_prefix="range", start=start_d, end=end_d, basename="equity")
 
 
 
@@ -2739,30 +2938,24 @@ elif nav == "📅 Calendar":
             sel_month = label_to_month[sel_month_label]
 
             # Trading days left this year (weekdays not holidays)
-            today = datetime.now(TIMEZONE_PACIFIC).date()
+            today = _today_pacific()
             end_year = date(today.year, 12, 31)
-            hols_left_map = build_holiday_map(today, end_year)
-            remaining = sum(
-                1
-                for n in range((end_year - today).days + 1)
-                if (today + timedelta(days=n)).weekday() < 5
-                and (today + timedelta(days=n)) not in hols_left_map
-            )
+            remaining = trading_days_between(today + timedelta(days=1), end_year)
 
             st.markdown("---", unsafe_allow_html=True)
             st.markdown(
                 f"""
                 <div class="mini-kpi">
-                <div class="mini-kpi__label">Trading days left</div>
+                <div class="mini-kpi__label">Trading days left in Year</div>
                 <div class="mini-kpi__val">{remaining}</div>
                 </div>
                 <style>
                 .mini-kpi {{
                     display:inline-block;
                     padding:10px 12px;
-                    border:1px solid #2f3a4a;
+                    border:1px solid var(--blue);
                     border-radius:10px;
-                    background:#0f1623;
+                    background:var(--bg-dark);
                     margin-top:6px;
                     text-align:center;
                     width:100%;
@@ -2770,7 +2963,7 @@ elif nav == "📅 Calendar":
                 .mini-kpi__label {{
                     font-size:14px;
                     font-weight:700;
-                    color:#a9bbcf;
+                    color:var(--ink-subtle);
                     margin-bottom:6px;
                     text-transform:uppercase;
                     letter-spacing:0.5px;
@@ -2778,13 +2971,45 @@ elif nav == "📅 Calendar":
                 .mini-kpi__val {{
                     font-size:36px;
                     font-weight:900;
-                    color:#ffffff;
+                    color:var(--white);
                     line-height:1.2;
                 }}
                 </style>
                 """,
                 unsafe_allow_html=True,
             )
+
+            # Trading days left this MONTH (weekdays not holidays)
+            # Month window: first → last day of *this* month
+            from calendar import monthrange
+
+            first_month_day = date(today.year, today.month, 1)
+            last_month_day = date(
+                today.year,
+                today.month,
+                monthrange(today.year, today.month)[1],
+            )
+
+            # start at tomorrow, but never before the first day of the month
+            start_month = max(today + timedelta(days=1), first_month_day)
+
+            if start_month > last_month_day:
+                remaining_month = 0
+            else:
+                remaining_month = trading_days_between(start_month, last_month_day)
+
+
+            # Render a second mini KPI just under the Year KPI
+            st.markdown(
+                f"""
+                <div class="mini-kpi" style="margin-top:8px;">
+                  <div class="mini-kpi__label">Trading days left in Month</div>
+                  <div class="mini-kpi__val">{remaining_month}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
 
         # ---- compute month boundaries + map data ----
         first = date(sel_year, sel_month, 1)
@@ -2811,67 +3036,115 @@ elif nav == "📅 Calendar":
         st.markdown(
             """
             <style>
-              .cal-wrap { overflow-x: auto; }
-              .cal-card { background: #0e1218; padding: 10px; border-radius: 10px; }
-              .cal-header {
-                    display:flex; align-items:flex-end; justify-content:space-between;
-                    gap:10px; margin: 4px 2px 10px 2px;
-              }
-              .cal-title {
-                    font-size: 25px;
-                    font-weight: 900;
-                    color: #e9eef7;
-                    letter-spacing: 0.2px;
-              }
-              .cal-month-fee {
-                    font-weight: 900;
-                    color:#a9bbcf;
-                    white-space: nowrap;
-                    font-size: 13px;
-                    opacity:.95;
-              }
-              .cal-month-fee .amt { color:#cfd9e6; }
-              .pl-pos { color: #428246; }
-              .pl-neg { color: #8b2d2d; }
-              .pl-neu { color: #e9eef7; }
+            .cal-wrap { overflow-x: auto; }
+            .cal-card {
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            padding: 0;
+            box-shadow: none;
+            }
 
-              table.cal { border-collapse: collapse; width: 100%; table-layout: fixed; }
-              table.cal th {
-                background:#1b2330; color:#eef3ff; padding:8px 6px; font-weight:900;
-                border:1px solid #394556; letter-spacing:.2px; font-size: 12px;
-              }
-              table.cal td {
-                height: 84px;
-                vertical-align: top;
-                border:1px solid #2f3a4a;
-                padding:6px;
-                background:#111825; color:#e9eef7;
-              }
-              .daynum { font-weight:900; font-size:13px; opacity:.95; }
-              .pnl { margin-top:4px; font-weight:900; font-size:13px; }
-              .fees { margin-top:2px; font-size:12px; color:#cbd5e1; font-weight:700; }
-              .trades { font-size:11px; opacity:.9; margin-top:2px; }
+            .cal-header {
+                display: flex; align-items: flex-end; justify-content: space-between;
+                gap: 12px; margin: 2px 2px 12px 2px;
+            }
+            .cal-title {
+                font-size: 26px; font-weight: 900; color: var(--ink);
+                letter-spacing: .3px;
+            }
+            /* P/L tint used inside the month title */
+            .pl-pos { color: var(--green); }
+            .pl-neg { color: var(--red); }
+            .pl-neu { color: var(--gray); }
 
-              .pos { background-color:#428246 !important; color:#ecffef !important; }
-              .pos .daynum,.pos .pnl,.pos .trades,.pos .fees { color:#ecffef !important; }
-              .neg { background-color:#8b2d2d !important; color:#ffeaea !important; }
-              .neg .daynum,.neg .pnl,.neg .trades,.neg .fees { color:#ffeaea !important; }
-              .hol { background-color:#cacfde !important; color:#111 !important; }
-              .hol .daynum,.hol .pnl,.hol .trades,.hol .fees { color:#111 !important; }
-              .neu { background-color:#162233 !important; color:#e9eef7 !important; }
-              .out { background-color:#0d1422 !important; color:#7f8aa1 !important; }
+            .cal-month-fee {
+                font-weight: 900; color: var(--orange);
+                white-space: nowrap; font-size: 16px; opacity: .95;
+            }
+            .cal-month-fee .amt { color: var(--orange); }
 
-              .gap { width: 10px; background: transparent; border: none !important; }
+            /* Table skeleton */
+            table.cal { border-collapse: separate; border-spacing: 0; width: 100%; table-layout: fixed; }
+            table.cal th, table.cal td { border: 1px solid var(--white-10); }
 
-              .wsum { font-weight:900; }
-              .wsum .fees { font-weight:900; }
-              .wsum.pos { background-color:#428246 !important; color:#ecffef !important; }
-              .wsum.neg { background-color:#8b2d2d !important; color:#ffeaea !important; }
-              .wsum.neu { background-color:#162233 !important; color:#e9eef7 !important; }
+            /* Header row */
+            table.cal th {
+                background: var(--bg-dark);
+                color: var(--ink);
+                font-weight: 900;
+                letter-spacing: .3px;
+                font-size: 12px;
+                padding: 8px 8px;
+                text-align: left;
+            }
+
+            /* Cells */
+            table.cal td {
+            vertical-align: top;
+            border: 2px solid var(--white-10);
+            padding: 8px;
+            background: var(--white-04);
+            color: var(--ink);
+            }
+
+            /* Fixed cell height (tweak 92–104px to taste) */
+            :root { --cal-cell-h: 70px; }
+
+            table.cal td > .cell {
+            height: var(--cal-cell-h);
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            overflow: hidden;            /* prevent cell growth */
+            }
+
+            /* Make all states use the same fixed inner height */
+            .pos > .cell,
+            .neg > .cell,
+            .hol > .cell,
+            .neu > .cell,
+            .out > .cell,
+            .wsum > .cell { height: var(--cal-cell-h); }
+
+            /* Text compactness so it fits the fixed box */
+            .daynum { font-weight: 900; font-size: 13px; line-height: 1.1; opacity: .95; }
+            .pnl    { margin-top: 4px; font-weight: 900; font-size: 13px; line-height: 1.15; }
+            .fees   { margin-top: 2px; font-size: 12px; line-height: 1.1; color: var(--orange); font-weight: 800; }
+            .trades { font-size: 11px; line-height: 1.1; opacity: .9; margin-top: 2px;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+            /* Day states */
+            .pos { background-color: var(--green) !important; color: var(--white) !important; }
+            .pos .daynum,.pos .pnl,.pos .trades,.pos .fees { color: var(--white) !important; }
+
+            .neg { background-color: var(--red) !important; color: var(--white) !important; }
+            .neg .daynum,.neg .pnl,.neg .trades,.neg .fees { color: var(--white) !important; }
+
+            .hol { background-color: var(--gray) !important; color: var(--black) !important; }
+            .hol .daynum,.hol .pnl,.hol .trades,.hol .fees { color: var(--black) !important; }
+
+            /* Neutral tones */
+            .neu { background-color: var(--white-04) !important; color: var(--ink) !important; }
+            .out { background-color: var(--bg-dark) !important; color: var(--ink-subtle) !important; }
+
+            /* Weekly sums column */
+            .wsum { font-weight: 900; }
+            .wsum .fees { font-weight: 900; }
+            .wsum.pos { background-color: var(--green) !important; color: var(--white) !important; }
+            .wsum.neg { background-color: var(--red) !important; color: var(--white) !important; }
+            .wsum.neu { background-color: var(--white-04) !important; color: var(--ink) !important; }
+
+            /* Spacer between grid and weekly sums (no visible border) */
+            .gap { width: 10px; background: transparent; border: none !important; }
+
+            /* Subtle hover feedback to prevent visual overlap feeling */
+            table.cal td:hover { outline: 2px solid var(--white-10); outline-offset: -2px; }
             </style>
             """,
             unsafe_allow_html=True,
         )
+
 
         # ---- grid & cells ----
         grid = build_month_grid(sel_year, sel_month)
@@ -2882,16 +3155,16 @@ elif nav == "📅 Calendar":
             IMPORTANT: We check holidays FIRST so names show up even if a daily row exists.
             """
             if d.month != sel_month:
-                return '<td class="out"></td>', 0.0, 0.0, 0
+                return '<td class="out"><div class="cell"></div></td>', 0.0, 0.0, 0
 
             # 1) Holiday override (weekday + named holiday)
             if d.weekday() < 5 and d in hols_named:
                 name = hols_named[d]
                 html = (
-                    f'<td class="hol">'
+                    f'<td class="hol"><div class="cell">'
                     f'  <div class="daynum">{d.day}</div>'
                     f'  <div class="trades"><b>{name}</b></div>'
-                    f"</td>"
+                    f'</div></td>'
                 )
                 return html, 0.0, 0.0, 0
 
@@ -2909,22 +3182,21 @@ elif nav == "📅 Calendar":
                     else ""
                 )
                 html = (
-                    f'<td class="{cls}">'
+                    f'<td class="{cls}"><div class="cell">'
                     f'  <div class="daynum">{d.day}</div>'
                     f'  <div class="pnl">{pnl_str}</div>'
                     f"  {fees_line}"
                     f'  <div class="trades">{trades} Trades</div>'
-                    f"</td>"
+                    f'</div></td>'
                 )
                 return html, pnl, fees_val, trades
 
             # 3) Empty weekday/weekend in month
             return (
-                f'<td class="neu"><div class="daynum">{d.day}</div></td>',
-                0.0,
-                0.0,
-                0,
+                f'<td class="neu"><div class="cell"><div class="daynum">{d.day}</div></div></td>',
+                0.0, 0.0, 0,
             )
+
 
         header_cells = [f"<th>{lbl}</th>" for lbl in header_labels] + [
             '<th class="gap"></th>',
@@ -2951,12 +3223,13 @@ elif nav == "📅 Calendar":
                 f'<div class="fees">Fees: ${wk_fees:,.2f}</div>' if wk_fees > 0 else ""
             )
             tds.append(
-                f'<td class="wsum {sum_cls}">'
+                f'<td class="wsum {sum_cls}"><div class="cell">'
                 f'  <div class="pnl">{wsum_str}</div>'
                 f"  {fees_line}"
                 f'  <div class="trades">{wk_trades} Trades</div>'
-                f"</td>"
+                f'</div></td>'
             )
+
             body_rows.append("<tr>" + "".join(tds) + "</tr>")
 
         # ---- Title: "Month YYYY — $XXXXX.XX" + right-justified Monthly Fees (if any) ----
@@ -3010,7 +3283,7 @@ else:
         dcurve["equity"] = dcurve["daily_profit"].cumsum()
 
         # ---- Precompute totals used in right rail ----
-        net_pl = float(dcurve["equity"].iloc[-1]) if not dcurve.empty else 0.0
+        net_pl = float(dcurve["equity"].iloc[-1]) if not dcurve.empty else 0.0  # total net
 
         total_trades = len(trades)
         wins = int((trades["profit"] > 0).sum())
@@ -3084,7 +3357,7 @@ else:
                     x=x,
                     y=y,
                     mode="lines",
-                    line=dict(width=3, color="#ffffff"),
+                    line=dict(width=3, color=COL.hex("white")),
                     name="Cumulative P/L",
                 )
             )
@@ -3145,7 +3418,7 @@ else:
             st.markdown("#### Top & Bottom Tickers (Total P/L)")
 
             tick_sum = (
-                trades.groupby("symbol")["profit"].sum().sort_values(ascending=False)
+                trades.groupby("symbol", observed=True)["profit"].sum().sort_values(ascending=False)
             )
             if tick_sum.empty:
                 st.info("No tickers to display yet.")
