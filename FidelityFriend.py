@@ -3,6 +3,7 @@ import io
 import re
 import time
 import math
+import json
 import platform
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -30,7 +31,43 @@ except Exception:
     Observer = None
     FileSystemEventHandler = object
 
-DEFAULT_CSV_PATH = r"C:\Users\an\Desktop\Trading\Temp\temp.csv"
+# --- Config (portable paths) ---
+def _expand_portable_path(p: str | None) -> str | None:
+    """Expand ~, %ENV%, and normalize separators cross-platform."""
+    if not p:
+        return None
+    p = os.path.expandvars(os.path.expanduser(p))
+    return os.path.normpath(p)
+
+def _load_config() -> dict:
+    """
+    Look for a config.json in the same directory as this script.
+    Keys supported:
+      - raw_csvs (unused here but kept for parity with your ecosystem)
+      - sec_schedule (unused here but kept for parity)
+      - temp_csv  <-- we will use this as the default CSV path
+    """
+    try:
+        here = Path(__file__).resolve().parent
+        cfg_path = here / "config.json"
+        if not cfg_path.exists():
+            return {}
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        # expand and normalize
+        for k in ("raw_csvs", "sec_schedule", "temp_csv"):
+            if k in cfg and isinstance(cfg[k], str):
+                cfg[k] = _expand_portable_path(cfg[k])
+        return cfg
+    except Exception:
+        return {}
+
+# Default path comes from config (falls back to a sane temp path)
+_CFG = _load_config()
+DEFAULT_CSV_PATH = _CFG.get(
+    "temp_csv",
+    _expand_portable_path(r"C:\Users\An Nguyen\Desktop\Trading\Temp\temp.csv")
+)
 
 PRICE_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
 DT_RE = re.compile(r"(\d{1,2}:\d{2}:\d{2})\s*(AM|PM)\s+(\d{2}/\d{2}/\d{4})", re.I)
@@ -54,6 +91,39 @@ ACCENT = "#4cc9f0"
 GREEN = "#00d97e"
 RED = "#ff5470"
 GRID = "#2a3041"
+
+FILL_MAX_POINTS = 1200  # don’t layer area fills when we have lots of points
+
+
+# Helper Functions
+def _pick_minute_interval(total_minutes: float, desired_ticks: int = 14, max_ticks: int = 16) -> int:
+    """
+    Pick a 'nice' minute interval aiming for more labels:
+      - Aim for ~desired_ticks across the span.
+      - Floor to a clock-friendly interval (5,10,15,20,30,60,120).
+      - If that would create > max_ticks, bump up one step to avoid crowding.
+    """
+    if total_minutes <= 0:
+        return 5
+
+    # target a smaller step (more labels) than before
+    ideal = max(5.0, float(total_minutes) / float(max(4, desired_ticks)))
+
+    # clock-friendly steps only
+    candidates = [5, 10, 15, 20, 30, 60, 120]
+
+    # choose the largest candidate <= ideal (tighter than ceiling)
+    floor_choices = [c for c in candidates if c <= ideal]
+    step = max(floor_choices) if floor_choices else 5
+
+    # guardrail: don't exceed a reasonable label count
+    est_ticks = max(2, int(total_minutes / step) + 1)
+    if est_ticks > max_ticks:
+        bigger = [c for c in candidates if c > step]
+        if bigger:
+            step = bigger[0]
+
+    return step
 
 
 class TradingCompanionApp:
@@ -315,6 +385,7 @@ class TradingCompanionApp:
 
         # track rows by symbol (used by diffing updater)
         self._tree_iids = {}  # symbol -> iid
+        self._tree_last_order = []
 
         # Chart area
         right = ttk.Frame(content)
@@ -504,17 +575,19 @@ class TradingCompanionApp:
         self.root.after(500, self._tick_clock)
 
     def _choose_path(self):
+        start_dir = os.path.dirname(self.path_var.get() or self.csv_path) or "."
         chosen = filedialog.askopenfilename(
             title="Select Fidelity CSV",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialdir=start_dir
         )
         if chosen:
             self.path_var.set(chosen)
             self.csv_path = chosen
             if _WATCHDOG_OK and os.path.exists(self.csv_path):
                 self._install_file_watch(self.csv_path)
-            # run the background/ debounced path
             self._request_data_refresh(reason="path chosen")
+
 
     # ---------------- FILE WATCH ----------------
     def _monitor_file(self):
@@ -617,6 +690,12 @@ class TradingCompanionApp:
     def _debounce_watchdog_refresh(self, reason: str = ""):
         """Coalesce bursts of FS events into a single refresh."""
         # cancel a pending timer if any
+        now = time.monotonic()
+        last = getattr(self, "_last_watchdog_schedule", 0.0)
+        if (now - last) < 0.35:  # ignore events inside 350ms window
+            return
+        setattr(self, "_last_watchdog_schedule", now)
+
         if self._watch_pending_id is not None:
             try:
                 self.root.after_cancel(self._watch_pending_id)
@@ -786,20 +865,22 @@ class TradingCompanionApp:
         ]
         df = pd.read_csv(
             file_path,
-            skiprows=header_idx,  # header row becomes the next line
+            skiprows=header_idx,
             header=0,
-            usecols=lambda c: c in required_cols,  # keep only what we use
-            thousands=",",  # handle "1,000"
-            dtype={  # keep as strings for vector ops; Quantity will be parsed later
+            usecols=required_cols,          # ← avoids Python callback per column
+            thousands=",",
+            dtype={
                 "Symbol": "string",
                 "Status": "string",
                 "Trade Description": "string",
                 "Quantity": "string",
                 "Order Time": "string",
             },
-            engine="c",  # fastest parser
+            engine="c",
             low_memory=False,
+            memory_map=True,                # ← faster disk->memory on large files
         )
+
 
         if df.empty:
             return pd.DataFrame(
@@ -883,19 +964,25 @@ class TradingCompanionApp:
         # Ensure chronological order (OrderDateTime is already sorted in parser, but be safe)
         df = df.sort_values("OrderDateTime", kind="mergesort")
 
-        # NEW
-        for row in df.itertuples(index=False):
-            sym = row.Symbol
-            px = float(row.Price)
-            side = str(row.Side)
-            qty = int(row.Quantity)
-            ts = row.OrderDateTime
+        # Ensure column order exactly matches the return below:
+        # ["Symbol","Price","Side","Quantity","OrderDateTime"]
+        for sym, px, side, qty, ts in df.itertuples(index=False, name=None):
+            px = float(px)
+            side = "Buy" if side == "Buy" else ("Sell" if side == "Sell" else None)
+            qty = int(qty)
+            if not side or qty <= 0:
+                continue
+
 
             if qty <= 0 or side not in ("Buy", "Sell"):
                 continue
 
             # Init per-symbol lot queue
             q = open_lots.setdefault(sym, deque())
+            append_completed = completed.append
+            q_append = q.append
+            q_popleft = q.popleft
+
 
             if side == "Buy":
                 # Buys CLOSE Short lots first (FIFO), then OPEN Long for any remainder
@@ -1027,7 +1114,6 @@ class TradingCompanionApp:
 
     # ---------------- UI UPDATE ----------------
     def _update_stat_cards(self):
-        import math
 
         # Read current stats safely
         pnl = float(self.stats.get("gross_pnl", 0.0) or 0.0)
@@ -1069,6 +1155,14 @@ class TradingCompanionApp:
 
         # Desired order: PnL desc
         items = sorted(sym_stats.items(), key=lambda kv: kv[1]["pnl"], reverse=True)
+        new_order = [sym for sym, _ in items]
+        if new_order == self._tree_last_order:
+            # Same ordering; update values/tags only, skip moving rows.
+            do_reorder = False
+        else:
+            do_reorder = True
+            self._tree_last_order = new_order
+
 
         seen_symbols = set()
         last_iid = ""
@@ -1093,9 +1187,9 @@ class TradingCompanionApp:
                 # Update in place if values changed
                 if tree.item(iid, "values") != values:
                     tree.item(iid, values=values, tags=(tag,))
-                # Reorder if necessary (move after last inserted)
-                if last_iid != iid:
+                if do_reorder and last_iid != iid:
                     tree.move(iid, "", "end")
+
                 last_iid = iid
             else:
                 # Insert new row
@@ -1131,15 +1225,18 @@ class TradingCompanionApp:
         self.ax.set_xlabel("Time (PT)", color=TEXT_MUTED)
         self.ax.set_ylabel("Profit/Loss ($)", color=TEXT_MUTED)
 
-        # Ticks: locator/formatter and styling
+        # Ticks: locator/formatter and styling (vectorized via tick_params)
         self.ax.xaxis.set_major_locator(self._x_locator)
         self.ax.xaxis.set_major_formatter(self._x_formatter)
+
+        # apply styles to all ticks without looping each repaint
+        self.ax.tick_params(axis="x", labelrotation=30, labelcolor=TEXT_PRIMARY)
+        self.ax.tick_params(axis="y", labelcolor=TEXT_PRIMARY)
+
+        # keep a tiny one-liner for right-justification only
         for lbl in self.ax.get_xticklabels():
-            lbl.set_rotation(30)
             lbl.set_ha("right")
-            lbl.set_color(TEXT_PRIMARY)
-        for lbl in self.ax.get_yticklabels():
-            lbl.set_color(TEXT_PRIMARY)
+
 
         # Zero baseline (keep a reference; draw only once)
         if not hasattr(self, "_zero_line") or self._zero_line.axes is not self.ax:
@@ -1187,8 +1284,6 @@ class TradingCompanionApp:
         """Create/update High/Low of Day annotations on the running P/L curve."""
         if not ts or not cum:
             return
-
-        import numpy as np
 
         # Find indices of max/min cumulative P/L
         arr = np.asarray(cum, dtype=float)
@@ -1258,6 +1353,14 @@ class TradingCompanionApp:
             self._lod_label.set_color(RED)
 
     def _paint_chart(self, completed):
+        # --- Remove any previous empty-overlay text if present ---
+        try:
+            for t in list(self.ax.texts):
+                if getattr(t, "get_text", lambda: "")() == "No trades to display":
+                    t.remove()
+        except Exception:
+            pass
+
         if not completed:
             # If no trades, still show a descriptive title for today
             self.ax.set_title(
@@ -1315,48 +1418,91 @@ class TradingCompanionApp:
         zeros = np.zeros(len(cum))
         times_num = mdates.date2num(ts)
         cum_arr = np.array(cum)
-        poly_pos = self.ax.fill_between(
-            times_num,
-            zeros,
-            cum_arr,
-            where=(cum_arr >= 0),
-            alpha=0.25,
-            interpolate=True,
-            zorder=2,
-            color=GREEN,
-        )
-        self._fill_polys.append(poly_pos)
 
-        poly_neg = self.ax.fill_between(
-            times_num,
-            zeros,
-            cum_arr,
-            where=(cum_arr < 0),
-            alpha=0.25,
-            interpolate=True,
-            zorder=2,
-            color=RED,
-        )
-        self._fill_polys.append(poly_neg)
+        # --- Conditionally fill areas to avoid slow polys on long sessions ---
+        if len(cum) <= FILL_MAX_POINTS:
+            # Remove old fills (if any)
+            if getattr(self, "_fill_polys", None):
+                for poly in self._fill_polys:
+                    try: poly.remove()
+                    except Exception: pass
+                self._fill_polys.clear()
+            else:
+                self._fill_polys = []
 
-        # X axis: real times (6:30, 6:45 …)
-        start = min(ts).replace(hour=6, minute=30, second=0, microsecond=0)
-        last = max(ts)
-        minute = last.minute
-        rounded_min = ((minute // 15) + 1) * 15
-        if rounded_min >= 60:
-            end = last.replace(
-                hour=min(last.hour + 1, 23), minute=0, second=0, microsecond=0
+            zeros = np.zeros(len(cum))
+            times_num = mdates.date2num(ts)
+            cum_arr = np.array(cum)
+
+            poly_pos = self.ax.fill_between(
+                times_num, zeros, cum_arr, where=(cum_arr >= 0),
+                alpha=0.25, interpolate=True, zorder=2, color=GREEN
             )
+            poly_neg = self.ax.fill_between(
+                times_num, zeros, cum_arr, where=(cum_arr < 0),
+                alpha=0.25, interpolate=True, zorder=2, color=RED
+            )
+            self._fill_polys.extend([poly_pos, poly_neg])
         else:
-            end = last.replace(minute=rounded_min, second=0, microsecond=0)
-        if end < start + timedelta(minutes=45):
-            end = start + timedelta(hours=1)
+            # If we previously had fills, clear them once
+            if getattr(self, "_fill_polys", None):
+                for poly in self._fill_polys:
+                    try: poly.remove()
+                    except Exception: pass
+                self._fill_polys.clear()
 
-        self.ax.set_xlim(start, end)
-        # --- Add/update High/Low of Day annotations ---
+
+        # --- Dynamic X axis ---
+        first = min(ts)
+        last = max(ts)
+
+        # Start 5 minutes before first trade (not earlier than midnight same day)
+        start = first - timedelta(minutes=5)
+        start = start.replace(second=0, microsecond=0)
+
+        # End rounded UP to the next 5 minutes after last trade
+        # e.g., if last is 10:32 -> end at 10:35; if 10:59 -> 11:00
+        overshoot_min = ((last.minute // 5) + 1) * 5
+        if overshoot_min >= 60:
+            end = last.replace(hour=min(last.hour + 1, 23), minute=0, second=0, microsecond=0)
+        else:
+            end = last.replace(minute=overshoot_min, second=0, microsecond=0)
+
+        # Ensure we at least show a reasonable minimum span (e.g., 30 min window)
+        if end <= start + timedelta(minutes=15):
+            end = start + timedelta(minutes=30)
+
+        new_xlim = (start, end)
+        if getattr(self, "_last_xlim", None) != new_xlim:
+            self.ax.set_xlim(start, end)
+            self._last_xlim = new_xlim
+
+
+        # Choose a locator interval that keeps labels readable.
+        total_minutes = (end - start).total_seconds() / 60.0
+        desired_ticks = 14
+        interval = _pick_minute_interval(total_minutes, desired_ticks=desired_ticks)
+
+        # --- Aligned tick locator ---
+        # For sub-hour steps, land ticks at :00, :05, :10, ... using byminute.
+        # For hourly/multi-hour steps, land ticks on the hour(s).
+        if interval < 60:
+            # e.g., every 5/10/15/20/30 minutes -> align to clean minute marks
+            self._x_locator = mdates.MinuteLocator(byminute=list(range(0, 60, interval)))
+            self.ax.xaxis.set_major_locator(self._x_locator)
+        else:
+            # 60 or 120 minutes -> align on the hour
+            hours = max(1, interval // 60)  # 1 for 60m, 2 for 120m
+            self._x_locator = mdates.HourLocator(interval=hours)
+            self.ax.xaxis.set_major_locator(self._x_locator)
+
+        # formatter already set earlier in _apply_static_axis_style
+
+
+        # --- Update HOD/LOD and draw ---
         self._update_hod_lod(ts, cum)
         self.canvas.draw_idle()
+
 
     # ---------------- COPY CHART ----------------
     def _copy_chart_to_clipboard(self):
